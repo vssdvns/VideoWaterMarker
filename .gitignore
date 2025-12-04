@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# VS Code
+.vscode/
+
+# Data (don’t push raw videos/images)
+data/input/*
+data/output/*
+data/debug/*
+
+# Keep the folders themselves
+!data/.gitkeep
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/debug/.gitkeep
