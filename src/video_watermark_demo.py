@@ -4,6 +4,19 @@ import numpy as np
 
 from models.saliency_deeplab import DeepLabSaliency
 
+def combine_maps(lap_map: np.ndarray, dl_map: np.ndarray, w_deeplab: float) -> np.ndarray:
+    """
+    Weighted fusion of Laplacian complexity and DeepLab saliency maps.
+    Both maps should be normalized in [0,1].
+    Returns combined map in [0,1] (approximately).
+    """
+    w_deeplab = float(np.clip(w_deeplab, 0.0, 1.0))
+    w_lap = 1.0 - w_deeplab
+    combined = (w_lap * lap_map) + (w_deeplab * dl_map)
+    combined = cv2.normalize(combined, None, 0.0, 1.0, cv2.NORM_MINMAX)
+    return combined.astype("float32")
+
+
 
 def compute_complexity_map(frame: np.ndarray) -> np.ndarray:
     """Return a normalized 'complexity' map based on edges."""
@@ -48,6 +61,12 @@ def add_text_watermark_fixed(
     output_path: Path,
     text: str = "VideoWaterMarker",
     alpha: float = 0.5,
+    use_saliency_model: bool = False,
+    use_hybrid: bool = False,
+    w_deeplab: float = 0.5,
+    temporal_smoothing: bool = True,
+    temporal_alpha: float = 0.8,
+    max_jump: int = 150,
 ) -> None:
     """Simple baseline: fixed bottom-right watermark for all frames."""
     print(f"[FIXED] Opening video: {input_path}")
@@ -114,6 +133,13 @@ def add_text_watermark_to_video(
     text: str = "VideoWaterMarker",
     alpha: float = 0.5,
     use_saliency_model: bool = False,
+
+    use_hybrid: bool = False,
+    w_deeplab: float = 0.5,
+
+    temporal_smoothing: bool = True,
+    temporal_alpha: float = 0.8,
+    max_jump: int = 150,
 ) -> None:
     """
     Add a semi-transparent text watermark per frame.
@@ -122,9 +148,18 @@ def add_text_watermark_to_video(
         - Use DeepLab-based saliency map to avoid foreground.
     Else:
         - Use Laplacian complexity map.
+
+    If temporal_smoothing=True:
+        - Smooth watermark position over time to avoid jitter.
     """
 
-    mode = "DEEPLAB" if use_saliency_model else "HEURISTIC"
+    if use_hybrid:
+        mode = f"HYBRID(wD={w_deeplab:.2f})"
+    elif use_saliency_model:
+        mode = "DEEPLAB"
+    else:
+        mode = "HEURISTIC"
+
     print(f"[{mode}] Opening video: {input_path}")
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -153,19 +188,60 @@ def add_text_watermark_to_video(
     if use_saliency_model:
         saliency_model = DeepLabSaliency()
 
+    prev_x, prev_y = None, None
+    max_jump_sq = max_jump * max_jump
+
     frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if use_saliency_model and saliency_model is not None:
-            guide_map = saliency_model.get_saliency_map(frame)  # high = foreground
-        else:
-            guide_map = compute_complexity_map(frame)  # high = busy
+        
+        lap_map = compute_complexity_map(frame)
 
-        # We still choose the lowest-average-value region
-        x, y = choose_low_complexity_region(guide_map, box_w, box_h, stride=32)
+        if use_hybrid:
+            # Ensure DeepLab model exists
+            if saliency_model is None:
+                saliency_model = DeepLabSaliency()
+            dl_map = saliency_model.get_saliency_map(frame)
+            guide_map = combine_maps(lap_map, dl_map, w_deeplab=w_deeplab)
+
+        elif use_saliency_model:
+            if saliency_model is None:
+                saliency_model = DeepLabSaliency()
+            guide_map = saliency_model.get_saliency_map(frame)
+
+        else:
+            guide_map = lap_map
+
+
+
+
+        # Instantaneous best candidate from the guide map
+        cand_x, cand_y = choose_low_complexity_region(guide_map, box_w, box_h, stride=32)
+
+        # Temporal smoothing of position
+        if temporal_smoothing and prev_x is not None and prev_y is not None:
+            dx = cand_x - prev_x
+            dy = cand_y - prev_y
+            dist_sq = dx * dx + dy * dy
+
+            if dist_sq <= max_jump_sq:
+                # Smooth: EMA between previous and candidate
+                x = int(temporal_alpha * prev_x + (1.0 - temporal_alpha) * cand_x)
+                y = int(temporal_alpha * prev_y + (1.0 - temporal_alpha) * cand_y)
+            else:
+                # Likely a scene change; allow jump
+                x, y = cand_x, cand_y
+        else:
+            x, y = cand_x, cand_y
+
+        # Clamp so the box stays fully inside frame
+        x = max(0, min(x, width - box_w - 1))
+        y = max(0, min(y, height - box_h - 1))
+
+        prev_x, prev_y = x, y
 
         overlay = frame.copy()
         text_x = x + 10
@@ -199,15 +275,22 @@ if __name__ == "__main__":
     in_path = project_root / "data" / "input" / "sample.mp4"
 
     out_simple = project_root / "data" / "output" / "sample_watermarked_simple.mp4"
-    out_heuristic = project_root / "data" / "output" / "sample_watermarked_heuristic.mp4"
-    out_deeplab = project_root / "data" / "output" / "sample_watermarked_deeplab.mp4"
+    out_heuristic = project_root / "data" / "output" / "sample_watermarked_heuristic_smooth.mp4"
+    out_deeplab = project_root / "data" / "output" / "sample_watermarked_deeplab_smooth.mp4"
+    
+    out_hybrid_50 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.50.mp4"
+    out_hybrid_70 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.70.mp4"
+    out_hybrid_25 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.25.mp4"
+    out_hybrid_75 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.75.mp4"
+
+
 
     print(f"[INFO] Input video:      {in_path}")
     print(f"[INFO] Simple output:    {out_simple}")
     print(f"[INFO] Heuristic output: {out_heuristic}")
     print(f"[INFO] DeepLab output:   {out_deeplab}")
 
-    # 1) Simple fixed watermark
+    # 1) Simple fixed watermark (no smoothing needed)
     add_text_watermark_fixed(
         input_path=in_path,
         output_path=out_simple,
@@ -215,20 +298,64 @@ if __name__ == "__main__":
         alpha=0.5,
     )
 
-    # 2) Heuristic Laplacian-based placement
+    # 2) Heuristic Laplacian-based placement with temporal smoothing
     add_text_watermark_to_video(
         input_path=in_path,
         output_path=out_heuristic,
         text="VideoWaterMarker",
         alpha=0.5,
         use_saliency_model=False,
+        temporal_smoothing=True,
     )
 
-    # 3) DeepLab-based saliency placement
+    # 3) DeepLab-based saliency placement with temporal smoothing
     add_text_watermark_to_video(
         input_path=in_path,
         output_path=out_deeplab,
         text="VideoWaterMarker",
         alpha=0.5,
         use_saliency_model=True,
+        temporal_smoothing=True,
+    )
+    # 4) Hybrid (balanced)
+    add_text_watermark_to_video(
+        input_path=in_path,
+        output_path=out_hybrid_50,
+        text="VideoWaterMarker",
+        alpha=0.5,
+        use_hybrid=True,
+        w_deeplab=0.50,
+        temporal_smoothing=True,
+    )
+
+    # 5) Hybrid (more semantic avoidance)
+    add_text_watermark_to_video(
+        input_path=in_path,
+        output_path=out_hybrid_70,
+        text="VideoWaterMarker",
+        alpha=0.5,
+        use_hybrid=True,
+        w_deeplab=0.70,
+        temporal_smoothing=True,
+    )
+    # 6) Hybrid (more heuristic / edge-smoothness)
+    add_text_watermark_to_video(
+        input_path=in_path,
+        output_path=out_hybrid_25,
+        text="VideoWaterMarker",
+        alpha=0.5,
+        use_hybrid=True,
+        w_deeplab=0.25,
+        temporal_smoothing=True,
+    )
+
+    # 7) Hybrid (more semantic avoidance)
+    add_text_watermark_to_video(
+        input_path=in_path,
+        output_path=out_hybrid_75,
+        text="VideoWaterMarker",
+        alpha=0.5,
+        use_hybrid=True,
+        w_deeplab=0.75,
+        temporal_smoothing=True,
     )

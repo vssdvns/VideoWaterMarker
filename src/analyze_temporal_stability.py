@@ -137,7 +137,8 @@ def main():
     # --- Smoothed versions ---
     heur_pos_s = ema_smooth_positions(heur_pos, alpha=0.8, max_jump=150)
     dl_pos_s = ema_smooth_positions(dl_pos, alpha=0.8, max_jump=150)
-
+    
+   # HYBRID placements (unsmoothed + smoothed) - using combined map
     # --- Compute metrics ---
     def report(name: str, pos: list[tuple[int, int]]):
         j = jitter_stats(pos, big_jump_thresh=50)
@@ -156,6 +157,21 @@ def main():
     report("HEURISTIC (smoothed)", heur_pos_s)
     report("DEEPLAB (unsmoothed)", dl_pos)
     report("DEEPLAB (smoothed)", dl_pos_s)
+
+    # HYBRID placements (unsmoothed + smoothed) - using combined map
+    for wD in [0.25, 0.50, 0.75]:
+        hyb_pos = []
+        for lap_m, dl_m in zip(lap_maps, dl_maps):
+            combined = (1.0 - wD) * lap_m + wD * dl_m
+            combined = cv2.normalize(combined, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+            x, y = choose_low_complexity_region(combined, box_w, box_h, stride=32)
+            hyb_pos.append(clamp_xy(x, y, w, h, box_w, box_h))
+
+        hyb_pos_s = ema_smooth_positions(hyb_pos, alpha=0.8, max_jump=150)
+
+        report(f"HYBRID(wD={wD:.2f}) (unsmoothed)", hyb_pos)
+        report(f"HYBRID(wD={wD:.2f}) (smoothed)", hyb_pos_s)
 
 
 if __name__ == "__main__":
