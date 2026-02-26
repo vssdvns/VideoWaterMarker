@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import torch
 from torchvision import models, transforms
+torch.backends.cudnn.benchmark = True
+
 
 
 @dataclass
@@ -95,7 +97,12 @@ class DeepLabSaliency:
         img_t, orig_size, resized_size = self._prepare_image(frame_bgr)
 
         # Forward pass
-        outputs = self.model(img_t)
+        if self.config.device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = self.model(img_t)
+        else:
+            outputs = self.model(img_t)
+            
         logits = outputs["out"]  # (1, C, H', W')
         probs = torch.softmax(logits, dim=1)  # per-class probabilities
 
@@ -112,5 +119,5 @@ class DeepLabSaliency:
         )
 
         # Normalize to [0,1]
-        saliency_np = cv2.normalize(saliency_np, None, 0.0, 1.0, cv2.NORM_MINMAX)
+        saliency_np = np.clip(saliency_np, 0.0, 1.0)
         return saliency_np.astype("float32")

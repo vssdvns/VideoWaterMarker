@@ -1,20 +1,28 @@
-# Python
+# venv
+.venv/
 __pycache__/
 *.pyc
 
-# Virtual env
-.venv/
-
-# VS Code
+# OS / editors
+.DS_Store
+Thumbs.db
 .vscode/
+.idea/
 
-# Data (don’t push raw videos/images)
-data/input/*
-data/output/*
-data/debug/*
+# data outputs (DON'T COMMIT)
+data/_tmp_xiph/
+data/clips_xiph_hd/
+data/clips_150/
+data/raw/
+data/input/
+data/output/
+data/out/
+data/attacks/
+data/bench*/
+data/debug/
+*.mp4
+*.webm
 
-# Keep the folders themselves
-!data/.gitkeep
-!data/input/.gitkeep
-!data/output/.gitkeep
-!data/debug/.gitkeep
+# logs / results
+*.log
+*.csv

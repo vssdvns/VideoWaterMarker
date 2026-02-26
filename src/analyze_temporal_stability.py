@@ -5,6 +5,31 @@ import numpy as np
 from models.saliency_deeplab import DeepLabSaliency
 from video_watermark_demo import compute_complexity_map, choose_low_complexity_region
 
+def compute_flow_farneback(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray:
+    prev_g = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
+    curr_g = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_g, curr_g, None,
+        pyr_scale=0.5, levels=3, winsize=21,
+        iterations=3, poly_n=5, poly_sigma=1.2,
+        flags=0
+    )
+    return flow
+
+
+def warp_map_with_flow(map2d: np.ndarray, flow: np.ndarray) -> np.ndarray:
+    h, w = map2d.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (grid_x - flow[..., 0]).astype(np.float32)
+    map_y = (grid_y - flow[..., 1]).astype(np.float32)
+    warped = cv2.remap(
+        map2d.astype(np.float32),
+        map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+    return warped
+
 
 def get_box_size(text: str = "VideoWaterMarker") -> tuple[int, int]:
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -138,7 +163,63 @@ def main():
     heur_pos_s = ema_smooth_positions(heur_pos, alpha=0.8, max_jump=150)
     dl_pos_s = ema_smooth_positions(dl_pos, alpha=0.8, max_jump=150)
     
-   # HYBRID placements (unsmoothed + smoothed) - using combined map
+    
+    # DeepLab + Optical Flow fused guide map
+    flow_beta = 0.7  # try 0.6/0.8 later if needed
+    dl_flow_pos = []
+
+    prev_frame = None
+    prev_guide = None
+
+    for frame, curr_dl in zip(frames, dl_maps):
+        guide = curr_dl
+
+        if prev_frame is not None and prev_guide is not None:
+            flow = compute_flow_farneback(prev_frame, frame)
+            prev_warped = warp_map_with_flow(prev_guide, flow)
+
+            b = float(np.clip(flow_beta, 0.0, 1.0))
+            guide = (b * guide + (1.0 - b) * prev_warped).astype(np.float32)
+            guide = cv2.normalize(guide, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+        x, y = choose_low_complexity_region(guide, box_w, box_h, stride=32)
+        dl_flow_pos.append(clamp_xy(x, y, w, h, box_w, box_h))
+
+        prev_frame = frame
+        prev_guide = guide
+
+    dl_flow_pos_s = ema_smooth_positions(dl_flow_pos, alpha=0.8, max_jump=150)
+    
+    # HYBRID(wD=0.50) + Optical Flow fused guide map
+    wD_hybrid = 0.50
+    flow_beta_h = 0.7
+
+    hyb_flow_pos = []
+    prev_frame = None
+    prev_guide = None
+
+    for frame, lap_m, dl_m in zip(frames, lap_maps, dl_maps):
+        guide = (1.0 - wD_hybrid) * lap_m + wD_hybrid * dl_m
+        guide = cv2.normalize(guide, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+        if prev_frame is not None and prev_guide is not None:
+            flow = compute_flow_farneback(prev_frame, frame)
+            prev_warped = warp_map_with_flow(prev_guide, flow)
+
+            b = float(np.clip(flow_beta_h, 0.0, 1.0))
+            guide = (b * guide + (1.0 - b) * prev_warped).astype(np.float32)
+            guide = cv2.normalize(guide, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+        x, y = choose_low_complexity_region(guide, box_w, box_h, stride=32)
+        hyb_flow_pos.append(clamp_xy(x, y, w, h, box_w, box_h))
+
+        prev_frame = frame
+        prev_guide = guide
+
+    hyb_flow_pos_s = ema_smooth_positions(hyb_flow_pos, alpha=0.8, max_jump=150)
+
+    
+    # HYBRID placements (unsmoothed + smoothed) - using combined map
     # --- Compute metrics ---
     def report(name: str, pos: list[tuple[int, int]]):
         j = jitter_stats(pos, big_jump_thresh=50)
@@ -157,6 +238,9 @@ def main():
     report("HEURISTIC (smoothed)", heur_pos_s)
     report("DEEPLAB (unsmoothed)", dl_pos)
     report("DEEPLAB (smoothed)", dl_pos_s)
+    report("DEEPLAB+FLOW (unsmoothed)", dl_flow_pos)
+    report("DEEPLAB+FLOW (smoothed)", dl_flow_pos_s)
+
 
     # HYBRID placements (unsmoothed + smoothed) - using combined map
     for wD in [0.25, 0.50, 0.75]:
@@ -172,6 +256,8 @@ def main():
 
         report(f"HYBRID(wD={wD:.2f}) (unsmoothed)", hyb_pos)
         report(f"HYBRID(wD={wD:.2f}) (smoothed)", hyb_pos_s)
+        report("HYBRID(wD=0.50)+FLOW (unsmoothed)", hyb_flow_pos)
+        report("HYBRID(wD=0.50)+FLOW (smoothed)", hyb_flow_pos_s)
 
 
 if __name__ == "__main__":
