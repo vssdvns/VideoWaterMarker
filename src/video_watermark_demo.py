@@ -4,7 +4,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from models.saliency_deeplab import DeepLabSaliency
+try:
+    from .models.saliency_deeplab import DeepLabSaliency
+except ImportError:
+    from models.saliency_deeplab import DeepLabSaliency
 
 
 def compute_flow_farneback(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray:

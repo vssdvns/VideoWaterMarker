@@ -1,9 +1,11 @@
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cv2
 import numpy as np
 
-from models.saliency_deeplab import DeepLabSaliency
-from video_watermark_demo import compute_complexity_map, choose_low_complexity_region
+from src.models.saliency_deeplab import DeepLabSaliency
+from src.video_watermark_demo import compute_complexity_map, choose_low_complexity_region
 
 
 def compute_watermark_box_positions(

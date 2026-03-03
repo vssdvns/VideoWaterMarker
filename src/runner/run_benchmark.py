@@ -102,7 +102,7 @@ def process_one(
                 str(search_pad),
                 "--thr",
                 str(thr),
-                
+                "--global_fallback",
             ]
         )
 

@@ -116,6 +116,8 @@ Tested on 26 HD clips under 17 attacks (blur, crop, reencode, rescale, etc.):
 
 ## CLI Usage
 
+Run from project root (`cd VideoWaterMarker`).
+
 **Watermark a single video:**
 ```bash
 python src/watermark_video.py --input video.mp4 --output out.mp4 --positions_out positions.json
