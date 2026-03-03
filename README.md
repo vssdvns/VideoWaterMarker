@@ -1,210 +1,180 @@
-\# VideoWaterMarker
+# VideoWaterMarker
 
+**Model-guided adaptive video watermarking** — Master's Project, CSU Sacramento
 
-
-Model-guided adaptive video watermarking project for my master's work at CSU Sacramento.
-
-
-
-The goal is to place visible watermarks in \*\*less intrusive regions\*\* of each video frame by using
-
-both simple image statistics and deep learning–based saliency, as a first step toward
-
-user-specific, piracy-resistant watermarking for OTT platforms.
-
-
+Places semi-transparent text watermarks in **less intrusive regions** of each video frame using Laplacian complexity + DeepLab semantic saliency, with user-specific fingerprinting for traceability.
 
 ---
 
+## What This Does
 
-
-\## Features (Phase 1)
-
-
-
-This repo currently implements \*\*three watermarking strategies\*\* and a simple evaluation pipeline:
-
-
-
-\### 1. Simple fixed watermark (baseline)
-
-
-
-\- Constant text watermark (e.g. `VideoWaterMarker`) placed at the \*\*bottom-right\*\* corner
-
-&nbsp; of every frame.
-
-\- Implemented in: `src/video\_watermark\_demo.py` → `add\_text\_watermark\_fixed(...)`.
-
-
-
-\### 2. Heuristic adaptive watermark (Laplacian complexity)
-
-
-
-\- Computes a \*\*Laplacian-based "complexity map"\*\* per frame using OpenCV.
-
-\- Treats low-complexity (smooth) regions as better locations for the watermark.
-
-\- Slides a window over the map and selects the \*\*lowest-average-complexity\*\* window.
-
-\- Implemented in:  
-
-&nbsp; - `compute\_complexity\_map(...)`  
-
-&nbsp; - `choose\_low\_complexity\_region(...)`  
-
-&nbsp; - used by `add\_text\_watermark\_to\_video(..., use\_saliency\_model=False)`.
-
-
-
-\### 3. DeepLab-based adaptive watermark (semantic saliency)
-
-
-
-\- Uses a pretrained \*\*DeepLabV3–ResNet50\*\* segmentation model (from `torchvision`)
-
-&nbsp; to obtain a per-pixel saliency / foreground map.
-
-\- Interprets \*\*background / low-saliency\*\* pixels as better locations for the watermark.
-
-\- Again uses the sliding window to place the watermark in the \*\*least-salient region\*\*.
-
-\- Implemented in:
-
-&nbsp; - `src/models/saliency\_deeplab.py` (`DeepLabSaliency`),
-
-&nbsp; - `add\_text\_watermark\_to\_video(..., use\_saliency\_model=True)`.
-
-
+1. **Watermarks videos** — Adds semi-transparent text (e.g. `VideoWaterMarker` or user ID) to video frames.
+2. **Smart placement** — Chooses low-complexity, low-saliency regions (avoids faces, objects, text).
+3. **Detects watermarks** — Confirms presence of the watermark in original or attacked videos.
+4. **Traceability** — Embeds user ID in the watermark so leaked copies can be traced back.
 
 ---
 
-
-
-\## Evaluation
-
-
-
-The script `src/analyze\_watermark\_saliency.py` compares the three strategies:
-
-
-
-\- For each frame in the \*\*original\*\* `sample.mp4`, it computes:
-
-&nbsp; - a Laplacian complexity map, and
-
-&nbsp; - (optionally) a DeepLab-based saliency map.
-
-\- For each method:
-
-&nbsp; - it computes where the watermark \*\*would\*\* be placed,
-
-&nbsp; - extracts that region from the evaluation map,
-
-&nbsp; - and averages the saliency values.
-
-
-
-This gives \*\*average saliency under the watermark region\*\*:
-
-
-
-\- Lower value ⇒ watermark sits in a "less important" region (better).
-
-
-
-Early results on one test video show:
-
-
-
-\- The \*\*heuristic method\*\* minimizes edge-based complexity (very smooth regions),
-
-\- The \*\*DeepLab-based method\*\* minimizes semantic saliency (avoids foreground objects),
-
-\- The \*\*simple baseline\*\* is worst on both metrics.
-
-
-
----
-
-
-
-## Phase 1 + 2: UI Application & Traceability
-
-An interactive Streamlit app for video watermarking with manual position adjustment and **user-specific fingerprinting**:
-
-- **Upload** a video (mp4, avi, mov, mkv)
-- **Choose** method: Fixed, Heuristic, DeepLab, or Hybrid
-- **Traceability**: optionally embed user ID / location / device in the watermark
-- **Generate** watermarked video
-- **Preview** the result
-- **Manual adjust**: view saliency/complexity heatmap, adjust X/Y position, re-export
-
-**Run from project root:**
+## Quick Start
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# Run the interactive app
 streamlit run src/app_watermark_ui.py
 ```
 
-**CLI demo (traceability):** `python -m src.demo_fingerprint --input video.mp4 --users user_001 user_002 --hybrid`
+Open the URL (usually http://localhost:8501) in your browser.
 
-For in-browser video preview, install [ffmpeg](https://ffmpeg.org/). Without it, use the download button to get the watermarked file.
-
-See `PROJECT_PLAN.md` for the roadmap. The project report is in `docs/REPORT.md` (convert to PDF with pandoc or a Markdown viewer).
+**Optional:** Install [ffmpeg](https://ffmpeg.org/) for in-browser video preview and attack testing.
 
 ---
 
+## App Overview
 
+The Streamlit app has **6 tabs**:
 
-\## Repository Structure
+### 1. Generate
+- **Upload** a video (mp4, avi, mov, mkv).
+- **Choose method:**
+  - **Fixed** — Bottom-right corner (baseline).
+  - **Heuristic** — Laplacian complexity (smooth regions).
+  - **DeepLab** — Semantic saliency (avoids foreground).
+  - **Hybrid** — Laplacian + DeepLab combined (recommended).
+- **Traceability (optional):** Enable and enter User ID, Location, Device to embed a unique fingerprint.
+- **Placement:** Prefer edges/corners (default) to reduce intrusion and improve crop resilience.
+- Click **Generate** to create the watermarked video.
 
+### 2. Preview
+- Watch the watermarked video.
+- **Compare:** Slider to view Original vs Watermarked frame-by-frame.
+- **Download** the watermarked video.
+- **Export summary** — Text file with settings (method, text, opacity, etc.).
 
+### 3. Manual Adjust
+- View the **saliency/complexity heatmap** (blue = less intrusive).
+- **Preset buttons:** Top-left, Top-right, Bottom-left, Bottom-right, Bottom-center.
+- **Sliders:** Fine-tune X/Y position.
+- **Keyframes:** Set position at multiple frames → interpolate → re-export.
+- Click **Re-export** to apply your changes.
 
-```text
+### 4. Detect (No Generate)
+- Upload a **watermarked video** and its **positions.json** (from when it was created).
+- Run detection to get:
+  - **Detection rate** — % of frames where watermark was found.
+  - **Embedded fingerprint** — The text in the watermark (e.g. `ID:user_001`).
+- Works with **previous files** — no need to generate in this session.
 
+### 5. Attack Test
+- Upload a watermarked video + positions.
+- **Select attacks:** blur, crop, reencode, grayscale, etc.
+- Run attacks → Run detection → View results per attack.
+- Shows how robust the watermark is to distortions.
+
+### 6. Traceability Info
+- Explains user-specific fingerprint flow.
+- Format examples: `ID:user_001`, `ID:a1b2c3d4`, `ID:a1b2.US-CA.ios`.
+
+---
+
+## Watermarking Methods
+
+| Method   | Description                                                                 |
+|----------|-----------------------------------------------------------------------------|
+| **Fixed** | Constant bottom-right position. Simple baseline.                            |
+| **Heuristic** | Laplacian edge map → low-complexity (smooth) regions.                       |
+| **DeepLab** | DeepLabV3-ResNet50 segmentation → avoids foreground objects.              |
+| **Hybrid** | Combines Laplacian + DeepLab with weighted fusion. Best balance.           |
+
+All adaptive methods use temporal smoothing (EMA) to avoid jitter between frames.
+
+---
+
+## Detection
+
+- **Template matching** with normalized cross-correlation (NCC).
+- **Multi-scale** — Handles slight size changes (0.7×–1.4×).
+- **Global fallback** — When local search fails, searches the full frame (downscaled).
+- **Threshold** — Default 0.40; higher = stricter.
+
+The `positions.json` file (saved when watermarking) tells the detector where to look and what template to use.
+
+---
+
+## Benchmark Results
+
+Tested on 26 HD clips under 17 attacks (blur, crop, reencode, rescale, etc.):
+
+- **Overall detection:** 94.6% (threshold 0.40)
+- **Severe crop (80px):** 52.4%
+- **Down-up rescale:** 94.7%
+
+**Ablation (no global fallback):** Detection drops to 81.6% overall, 0.7% on crop80, 25% on rescale — global fallback is essential.
+
+---
+
+## CLI Usage
+
+**Watermark a single video:**
+```bash
+python src/watermark_video.py --input video.mp4 --output out.mp4 --positions_out positions.json
+```
+
+**Generate videos with different user fingerprints:**
+```bash
+python -m src.demo_fingerprint --input video.mp4 --users user_001 user_002 alice --hybrid
+```
+
+**Run full benchmark** (see `src/runner/run_benchmark.py`).
+
+---
+
+## Project Structure
+
+```
 VideoWaterMarker/
+├── README.md
+├── PROJECT_PLAN.md
+├── requirements.txt
+├── docs/
+│   ├── REPORT.md          # Master's project report
+│   └── README.md          # How to convert report to PDF
+├── data/
+│   ├── input/             # Place input videos here (gitignored)
+│   └── output/            # Watermarked outputs (gitignored)
+└── src/
+    ├── app_watermark_ui.py    # Main Streamlit app
+    ├── video_watermark_demo.py# Watermarking logic
+    ├── detect_watermark.py    # Detection logic
+    ├── fingerprint.py         # User ID encoding
+    ├── run_attacks.py        # Apply distortion attacks
+    ├── run_attacks_ui.py     # Attack runner for UI
+    ├── demo_fingerprint.py   # CLI fingerprint demo
+    └── models/
+        └── saliency_deeplab.py  # DeepLabV3-ResNet50 wrapper
+```
 
-&nbsp; .gitignore
+---
 
-&nbsp; README.md
+## Report
 
-&nbsp; test\_setup.py           # quick check for torch, cv2, numpy, matplotlib versions
+The Master's project report is in **`docs/REPORT.md`** (~15 pages). To convert to PDF:
 
+```bash
+pandoc docs/REPORT.md -o docs/REPORT.pdf --pdf-engine=xelatex -V geometry:margin=1in
+```
 
+---
 
-&nbsp; data/
+## Requirements
 
-&nbsp;   input/                # place your input images/videos here (ignored by git)
+- Python 3.10+
+- OpenCV, NumPy, PyTorch, torchvision, Streamlit
+- ffmpeg (optional, for video preview and attack testing)
 
-&nbsp;   output/               # watermarked outputs (ignored by git)
+---
 
-&nbsp;   debug/                # heatmaps / debug images (ignored by git)
+## License
 
-
-
-&nbsp; src/
-
-&nbsp;   app\_watermark\_ui.py           # Phase 1+2: Streamlit UI (watermark + traceability)
-
-&nbsp;   fingerprint.py                 # Phase 2: user ID encoding for traceability
-
-&nbsp;   demo\_fingerprint.py            # Phase 2: CLI demo with multiple user IDs
-
-&nbsp;   video\_watermark\_demo.py       # main script: generates watermarked videos
-
-&nbsp;   watermark\_demo.py             # basic image watermark example
-
-&nbsp;   debug\_complexity\_heatmap.py   # saves visualizations of the complexity heatmap
-
-&nbsp;   analyze\_watermark\_saliency.py # evaluation of placement strategies
-
-
-
-&nbsp;   models/
-
-&nbsp;     saliency\_deeplab.py         # DeepLabV3-ResNet50 wrapper for saliency maps
-
-
-
+Academic project — CSU Sacramento.
