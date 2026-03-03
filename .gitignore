@@ -16,6 +16,7 @@ data/clips_150/
 data/raw/
 data/input/
 data/output/
+data/app/
 data/out/
 data/attacks/
 data/bench*/

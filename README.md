@@ -130,6 +130,34 @@ Early results on one test video show:
 
 
 
+## Phase 1 + 2: UI Application & Traceability
+
+An interactive Streamlit app for video watermarking with manual position adjustment and **user-specific fingerprinting**:
+
+- **Upload** a video (mp4, avi, mov, mkv)
+- **Choose** method: Fixed, Heuristic, DeepLab, or Hybrid
+- **Traceability**: optionally embed user ID / location / device in the watermark
+- **Generate** watermarked video
+- **Preview** the result
+- **Manual adjust**: view saliency/complexity heatmap, adjust X/Y position, re-export
+
+**Run from project root:**
+
+```bash
+pip install -r requirements.txt
+streamlit run src/app_watermark_ui.py
+```
+
+**CLI demo (traceability):** `python -m src.demo_fingerprint --input video.mp4 --users user_001 user_002 --hybrid`
+
+For in-browser video preview, install [ffmpeg](https://ffmpeg.org/). Without it, use the download button to get the watermarked file.
+
+See `PROJECT_PLAN.md` for the roadmap. The project report is in `docs/REPORT.md` (convert to PDF with pandoc or a Markdown viewer).
+
+---
+
+
+
 \## Repository Structure
 
 
@@ -158,7 +186,13 @@ VideoWaterMarker/
 
 &nbsp; src/
 
-&nbsp;   video\_watermark\_demo.py       # main script: generates 3 watermarked videos
+&nbsp;   app\_watermark\_ui.py           # Phase 1+2: Streamlit UI (watermark + traceability)
+
+&nbsp;   fingerprint.py                 # Phase 2: user ID encoding for traceability
+
+&nbsp;   demo\_fingerprint.py            # Phase 2: CLI demo with multiple user IDs
+
+&nbsp;   video\_watermark\_demo.py       # main script: generates watermarked videos
 
 &nbsp;   watermark\_demo.py             # basic image watermark example
 

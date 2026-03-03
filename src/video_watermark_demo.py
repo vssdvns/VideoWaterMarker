@@ -67,23 +67,46 @@ def compute_complexity_map(frame: np.ndarray) -> np.ndarray:
     return comp.astype("float32")
 
 
+def _in_edge_zone(x: int, y: int, box_w: int, box_h: int, w: int, h: int, edge_margin: float) -> bool:
+    """True if window (x,y) is in the edge band (outer margin from each side)."""
+    pad_w = max(box_w, int(w * edge_margin))
+    pad_h = max(box_h, int(h * edge_margin))
+    # Center of window
+    cx = x + box_w / 2
+    cy = y + box_h / 2
+    # In edge zone if near left, right, top, or bottom
+    return (
+        cx <= pad_w or cx >= w - pad_w or
+        cy <= pad_h or cy >= h - pad_h
+    )
+
+
 def choose_low_complexity_region(
     map2d: np.ndarray,
     box_w: int,
     box_h: int,
     stride: int = 32,
+    prefer_edges: bool = False,
+    edge_margin: float = 0.12,
 ) -> tuple[int, int]:
     """
     Slide a window over the given 2D map and return (x, y) for the
     top-left corner of the lowest-average-value window.
     (Low value = good place for watermark.)
+
+    If prefer_edges=True, only consider windows in the outer edge band
+    (within edge_margin of frame borders). This keeps the watermark near
+    corners/edges for less intrusion and better crop resilience.
     """
     h, w = map2d.shape
     best_score = float("inf")
-    best_xy = (w - box_w - 20, h - box_h - 20)  # fallback: bottom-right-ish
+    fallback = (max(0, w - box_w - 20), max(0, h - box_h - 20))
+    best_xy = fallback
 
     for y in range(0, max(h - box_h, 1), stride):
         for x in range(0, max(w - box_w, 1), stride):
+            if prefer_edges and not _in_edge_zone(x, y, box_w, box_h, w, h, edge_margin):
+                continue
             region = map2d[y : y + box_h, x : x + box_w]
             if region.shape[0] < box_h or region.shape[1] < box_w:
                 continue
@@ -106,6 +129,8 @@ def add_text_watermark_fixed(
     temporal_smoothing: bool = True,
     temporal_alpha: float = 0.8,
     max_jump: int = 150,
+    save_positions: bool = False,
+    positions_path: Path | None = None,
 ) -> None:
     """Simple baseline: fixed bottom-right watermark for all frames."""
     print(f"[FIXED] Opening video: {input_path}")
@@ -140,6 +165,7 @@ def add_text_watermark_fixed(
     text_x = x + 10
     text_y = y + box_h - 10
 
+    positions = []
     frame_idx = 0
     while True:
         ret, frame = cap.read()
@@ -160,12 +186,24 @@ def add_text_watermark_fixed(
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         out.write(frame)
 
+        if save_positions and positions_path is not None:
+            t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+            positions.append({
+                "frame": frame_idx, "t_ms": t_ms, "x": x, "y": y,
+                "box_w": box_w, "box_h": box_h, "text": text,
+                "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
+            })
         frame_idx += 1
         if frame_idx % 50 == 0:
             print(f"[FIXED] Processed {frame_idx}/{frame_count} frames...")
 
     cap.release()
     out.release()
+    if save_positions and positions_path and positions:
+        import json
+        positions_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(positions_path, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2)
     print(f"[FIXED] Saved watermarked video to: {output_path}")
 
 
@@ -186,6 +224,8 @@ def add_text_watermark_to_video(
     flow_beta: float = 0.7,
     save_positions: bool = False,
     positions_path: Path | None = None,
+    prefer_edges: bool = True,
+    edge_margin: float = 0.12,
 
 ) -> None:
     """
@@ -285,7 +325,10 @@ def add_text_watermark_to_video(
 
 
         # Instantaneous best candidate from the guide map
-        cand_x, cand_y = choose_low_complexity_region(guide_map, box_w, box_h, stride=32)
+        cand_x, cand_y = choose_low_complexity_region(
+            guide_map, box_w, box_h, stride=32,
+            prefer_edges=prefer_edges, edge_margin=edge_margin,
+        )
 
         # Temporal smoothing of position
         if temporal_smoothing and prev_x is not None and prev_y is not None:
@@ -325,6 +368,8 @@ def add_text_watermark_to_video(
                 "temporal_alpha": float(temporal_alpha),
                 "max_jump": int(max_jump),
                 "alpha": float(alpha),
+                "font_scale": float(font_scale),
+                "thickness": int(thickness),
             })
 
         overlay = frame.copy()
@@ -365,11 +410,311 @@ def add_text_watermark_to_video(
 
 
 
+def add_text_watermark_from_positions(
+    input_path: Path,
+    output_path: Path,
+    positions_path: Path,
+    text: str = "VideoWaterMarker",
+    alpha: float = 0.5,
+) -> None:
+    """
+    Apply watermark at positions from a JSON file (for manual-override / re-export).
+    positions_path: path to positions.json (from previous watermark run or UI editor).
+    """
+    import json
+
+    with open(positions_path, "r", encoding="utf-8") as f:
+        positions = json.load(f)
+    if not positions:
+        raise ValueError("positions.json is empty")
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    frame_idx = 0
+    pos_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        pos_idx = min(frame_idx, len(positions) - 1)
+        p = positions[pos_idx]
+        x = int(p["x"])
+        y = int(p["y"])
+        box_w = int(p["box_w"])
+        box_h = int(p["box_h"])
+        font_scale = float(p.get("font_scale", 1.0))
+        thickness = int(p.get("thickness", 2))
+
+        x = max(0, min(x, width - box_w - 1))
+        y = max(0, min(y, height - box_h - 1))
+        text_x = x + 10
+        text_y = y + box_h - 10
+
+        overlay = frame.copy()
+        cv2.putText(
+            overlay,
+            text,
+            (text_x, text_y),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        out.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    out.release()
+
+
+def add_text_watermark_fixed_at(
+    input_path: Path,
+    output_path: Path,
+    x: int,
+    y: int,
+    text: str = "VideoWaterMarker",
+    alpha: float = 0.5,
+    positions_path: Path | None = None,
+) -> None:
+    """
+    Fixed watermark at user-specified (x, y) for all frames.
+    Optionally saves positions.json for detection.
+    """
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    s = width / 1280.0
+    font_scale = float(np.clip(1.0 * s, 0.8, 2.0))
+    thickness = max(2, int(round(2 * s)))
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    box_w = text_w + 20
+    box_h = text_h + 20
+
+    x = max(0, min(x, width - box_w - 1))
+    y = max(0, min(y, height - box_h - 1))
+    text_x = x + 10
+    text_y = y + box_h - 10
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    positions = []
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        overlay = frame.copy()
+        cv2.putText(overlay, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        out.write(frame)
+        if positions_path is not None:
+            t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+            positions.append({
+                "frame": frame_idx, "t_ms": t_ms, "x": x, "y": y,
+                "box_w": box_w, "box_h": box_h, "text": text,
+                "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
+            })
+        frame_idx += 1
+
+    cap.release()
+    out.release()
+    if positions_path and positions:
+        import json
+        positions_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(positions_path, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2)
+
+
+def get_frame_heatmap(
+    video_path: Path,
+    frame_idx: int,
+    method: str = "hybrid",
+    w_deeplab: float = 0.6,
+    saliency_model: DeepLabSaliency | None = None,
+    prefer_edges: bool = True,
+    edge_margin: float = 0.12,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float, int]:
+    """
+    Get frame at index, compute heatmap, and suggested watermark position.
+    Returns: (frame_bgr, heatmap_overlay_rgb, x, y, box_w, box_h, font_scale, thickness)
+    method: "fixed" | "heuristic" | "deeplab" | "hybrid"
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise ValueError(f"Could not read frame {frame_idx}")
+
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    s = w / 1280.0
+    font_scale = float(np.clip(1.0 * s, 0.8, 2.0))
+    thickness = max(2, int(round(2 * s)))
+    (text_w, text_h), _ = cv2.getTextSize("VideoWaterMarker", font, font_scale, thickness)
+    box_w = text_w + 20
+    box_h = text_h + 20
+
+    if method == "fixed":
+        x = w - box_w - 20
+        y = h - box_h - 20
+        guide_map = compute_complexity_map(frame)
+    else:
+        lap_map = compute_complexity_map(frame)
+        if method == "heuristic":
+            guide_map = lap_map
+        else:
+            if saliency_model is None:
+                saliency_model = DeepLabSaliency()
+            dl_map = saliency_model.get_saliency_map(frame)
+            if method == "deeplab":
+                guide_map = dl_map
+            else:
+                guide_map = combine_maps(lap_map, dl_map, w_deeplab)
+        x, y = choose_low_complexity_region(
+            guide_map, box_w, box_h, stride=32,
+            prefer_edges=prefer_edges, edge_margin=edge_margin,
+        )
+
+    x = max(0, min(x, w - box_w - 1))
+    y = max(0, min(y, h - box_h - 1))
+
+    guide_norm = cv2.normalize(guide_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    heatmap_rgb = cv2.applyColorMap(guide_norm, cv2.COLORMAP_JET)
+    heatmap_overlay = cv2.addWeighted(frame, 0.6, heatmap_rgb, 0.4, 0)
+
+    return frame, heatmap_overlay, x, y, box_w, box_h, font_scale, thickness
+
+
+def interpolate_keyframes_to_positions(
+    keyframes: list[tuple[int, int, int]],
+    frame_count: int,
+    base_pos: dict,
+    fps: float = 30.0,
+) -> list[dict]:
+    """
+    Interpolate (x, y) from keyframes to all frames.
+    keyframes: [(frame_idx, x, y), ...] sorted by frame_idx.
+    base_pos: template dict with box_w, box_h, text, font_scale, thickness, alpha.
+    """
+    if not keyframes:
+        return []
+    keyframes = sorted(keyframes, key=lambda k: k[0])
+
+    def interp(frame_idx: int) -> tuple[int, int]:
+        if frame_idx <= keyframes[0][0]:
+            return keyframes[0][1], keyframes[0][2]
+        if frame_idx >= keyframes[-1][0]:
+            return keyframes[-1][1], keyframes[-1][2]
+        for i in range(len(keyframes) - 1):
+            f0, x0, y0 = keyframes[i]
+            f1, x1, y1 = keyframes[i + 1]
+            if f0 <= frame_idx <= f1:
+                t = (frame_idx - f0) / max(1, f1 - f0)
+                x = int(x0 + t * (x1 - x0))
+                y = int(y0 + t * (y1 - y0))
+                return x, y
+        return keyframes[-1][1], keyframes[-1][2]
+
+    positions = []
+    for fidx in range(frame_count):
+        x, y = interp(fidx)
+        t_ms = 1000.0 * fidx / max(1.0, fps)
+        p = dict(base_pos)
+        p["frame"] = fidx
+        p["t_ms"] = t_ms
+        p["x"] = x
+        p["y"] = y
+        positions.append(p)
+    return positions
+
+
+def add_text_watermark_from_keyframes(
+    input_path: Path,
+    output_path: Path,
+    keyframes: list[tuple[int, int, int]],
+    text: str = "VideoWaterMarker",
+    alpha: float = 0.5,
+    positions_path: Path | None = None,
+) -> None:
+    """
+    Apply watermark using keyframe-interpolated positions.
+    keyframes: [(frame_idx, x, y), ...]. Positions for other frames are interpolated.
+    """
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {input_path}")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    s = width / 1280.0
+    font_scale = float(np.clip(1.0 * s, 0.8, 2.0))
+    thickness = max(2, int(round(2 * s)))
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    box_w = text_w + 20
+    box_h = text_h + 20
+
+    base_pos = {
+        "box_w": box_w, "box_h": box_h, "text": text,
+        "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
+    }
+    positions = interpolate_keyframes_to_positions(keyframes, frame_count, base_pos, fps)
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        import json
+        json.dump(positions, f, indent=2)
+        tmp_path = Path(f.name)
+    try:
+        add_text_watermark_from_positions(
+            input_path, output_path, tmp_path,
+            text=text, alpha=alpha,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if positions_path and positions:
+        import json
+        positions_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(positions_path, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2)
+
+
 if __name__ == "__main__":
     from pathlib import Path
 
     # Choose what to run
-    MODE = "final"   # "final" or "ablation"
+    MODE = "ablation"   # "final" or "ablation"
 
     project_root = Path(__file__).resolve().parents[1]
     in_path = project_root / "data" / "input" / "sample.mp4"
@@ -380,14 +725,17 @@ if __name__ == "__main__":
     positions_path=out_final.with_suffix(".positions.json"),
 
     # ---------- ABLATION outputs ----------
-    out_simple = project_root / "data" / "output" / "sample_watermarked_simple.mp4"
-    out_heuristic = project_root / "data" / "output" / "sample_watermarked_heuristic_smooth.mp4"
-    out_deeplab = project_root / "data" / "output" / "sample_watermarked_deeplab_smooth.mp4"
-    out_hybrid_25 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.25.mp4"
-    out_hybrid_50 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.50.mp4"
-    out_hybrid_75 = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.75.mp4"
-    out_deeplab_flow = project_root / "data" / "output" / "sample_watermarked_deeplab_flow.mp4"
-    out_hybrid_50_flow = project_root / "data" / "output" / "sample_watermarked_hybrid_wd0.50_flow.mp4"
+    
+    out_deeplab_flow = project_root / "data" / "output" / "watermarked_deeplab_flow" / "sample.mp4"
+    out_hybrid_50_flow = project_root / "data" / "output" / "hybrid_wd0.50_flow" / "sample.mp4"
+    
+    
+    out_simple = project_root / "data" / "output" / "simple" / "sample.mp4"
+    out_heuristic = project_root / "data" / "output" / "heuristic" / "sample.mp4"
+    out_deeplab = project_root / "data" / "output" / "deeplab" / "sample.mp4"
+    out_hybrid_25 = project_root / "data" / "output" / "hybrid_wd0.25" / "sample.mp4"
+    out_hybrid_50 = project_root / "data" / "output" / "hybrid_wd0.50" / "sample.mp4"
+    out_hybrid_75 = project_root / "data" / "output" / "hybrid_wd0.75" / "sample.mp4"
 
     print(f"[INFO] Input video: {in_path}")
     print(f"[INFO] MODE: {MODE}")

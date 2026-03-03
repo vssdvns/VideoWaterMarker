@@ -26,14 +26,11 @@ def find_nearest_pos_idx(times: np.ndarray, t_ms: float) -> int:
     return i
 
 
-def build_text_template(text: str, box_w: int, box_h: int) -> np.ndarray:
+def build_text_template(text: str, box_w: int, box_h: int, font_scale: float, thickness: int) -> np.ndarray:
     tpl = np.zeros((box_h, box_w, 3), dtype=np.uint8)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.0
-    thickness = 2
-    cv2.putText(tpl, text, (10, box_h - 10), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    cv2.putText(tpl, text, (10, box_h - 10), font, float(font_scale), (255, 255, 255), int(thickness), cv2.LINE_AA)
     return cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
-
 
 def clamp(v, lo, hi):
     return max(lo, min(v, hi))
@@ -76,17 +73,26 @@ def global_fallback_score(
 ) -> float:
     """
     Global search across whole frame (optionally downscaled for speed).
+    IMPORTANT: if we downscale the frame, we must downscale the template too.
     """
-    if downscale is not None and 0.0 < downscale < 1.0:
-        h, w = frame_g.shape[:2]
-        nw = max(32, int(round(w * downscale)))
-        nh = max(32, int(round(h * downscale)))
-        frame_g_small = cv2.resize(frame_g, (nw, nh), interpolation=cv2.INTER_AREA)
-        # template should be scaled similarly by the multiscale loop, so just reuse it
-        return ncc_max_multiscale(frame_g_small, template_g, scales=scales)
-    else:
-        return ncc_max_multiscale(frame_g, template_g, scales=scales)
+    ds = float(downscale) if downscale is not None else 1.0
+    if not (0.0 < ds <= 1.0):
+        ds = 1.0
 
+    if ds < 1.0:
+        h, w = frame_g.shape[:2]
+        nw = max(64, int(round(w * ds)))
+        nh = max(64, int(round(h * ds)))
+        frame_g_small = cv2.resize(frame_g, (nw, nh), interpolation=cv2.INTER_AREA)
+
+        th, tw = template_g.shape[:2]
+        ntw = max(10, int(round(tw * ds)))
+        nth = max(10, int(round(th * ds)))
+        template_small = cv2.resize(template_g, (ntw, nth), interpolation=cv2.INTER_AREA)
+
+        return ncc_max_multiscale(frame_g_small, template_small, scales=scales)
+
+    return ncc_max_multiscale(frame_g, template_g, scales=scales)
 
 def detect_video(
     video_path: Path,
@@ -149,7 +155,9 @@ def detect_video(
             )
             if gscore > best_score:
                 best_score = gscore
-
+        if best_score < 0:
+            best_score = 0.0
+            
         scores.append(best_score)
         total += 1
         if best_score >= thr:
@@ -196,10 +204,22 @@ def main():
     pos_json = Path(args.pos_json)
 
     positions = json.loads(pos_json.read_text(encoding="utf-8"))
+
     text = positions[0].get("text", "VideoWaterMarker")
     box_w = int(positions[0]["box_w"])
     box_h = int(positions[0]["box_h"])
-    template_g = build_text_template(text, box_w, box_h)
+
+    # ✅ NEW: read actual embedding parameters
+    font_scale = float(positions[0].get("font_scale", 1.0))
+    thickness  = int(positions[0].get("thickness", 2))
+
+    template_g = build_text_template(
+        text,
+        box_w,
+        box_h,
+        font_scale,
+        thickness,
+    )
 
     vids = sorted(attacks_dir.glob("*.mp4"))
     if not vids:
