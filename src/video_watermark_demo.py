@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
+
 import cv2
 import numpy as np
 
@@ -8,6 +10,58 @@ try:
     from .models.saliency_deeplab import DeepLabSaliency
 except ImportError:
     from models.saliency_deeplab import DeepLabSaliency
+
+try:
+    from .models.saliency_u2net import U2NetSaliency
+except ImportError:
+    U2NetSaliency = None
+
+try:
+    from .dct_watermark import embed_dct_watermark
+except ImportError:
+    embed_dct_watermark = None
+
+_raft_model = None
+
+
+def compute_flow_raft(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray | None:
+    """RAFT optical flow (proposal). Returns (H,W,2) or None if unavailable."""
+    global _raft_model
+    try:
+        import torch
+        from torchvision import transforms as T
+        from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+        if _raft_model is None:
+            w = Raft_Small_Weights.DEFAULT
+            m = raft_small(weights=w).eval().to("cuda" if torch.cuda.is_available() else "cpu")
+            _raft_model = (m, w.transforms())
+    except Exception:
+        return None
+
+    import torch
+    model, transforms = _raft_model
+    dev = next(model.parameters()).device
+    prev_rgb = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2RGB)
+    curr_rgb = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2RGB)
+    h, w = prev_bgr.shape[:2]
+    # RAFT: H,W div by 8; use transforms for [-1,1]
+    nh, nw = (h // 8) * 8, (w // 8) * 8
+    nh, nw = max(64, nh), max(64, nw)
+    pt = torch.from_numpy(prev_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+    ct = torch.from_numpy(curr_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+    pt = T.functional.resize(pt, [nh, nw], antialias=False)
+    ct = T.functional.resize(ct, [nh, nw], antialias=False)
+    pt, ct = transforms(pt, ct)
+    pt, ct = pt.to(dev), ct.to(dev)
+    with torch.no_grad():
+        flow = model(pt, ct)[-1]  # (1,2,H,W)
+    flow = flow.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    scale_x = w / flow.shape[1]
+    scale_y = h / flow.shape[0]
+    flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+    flow[..., 0] *= scale_x
+    flow[..., 1] *= scale_y
+    return flow.astype(np.float32)
 
 
 def compute_flow_farneback(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray:
@@ -224,11 +278,16 @@ def add_text_watermark_to_video(
     temporal_alpha: float = 0.8,
     max_jump: int = 150,
     use_optical_flow: bool = False,
+    use_raft_flow: bool = False,
     flow_beta: float = 0.7,
+    saliency_type: str = "deeplab",
     save_positions: bool = False,
     positions_path: Path | None = None,
     prefer_edges: bool = True,
     edge_margin: float = 0.12,
+    embed_dct_payload: Optional[bytes] = None,
+    dct_strength: float = 3.0,
+    dct_roi_size: int = 64,
 
 ) -> None:
     """
@@ -250,7 +309,7 @@ def add_text_watermark_to_video(
     else:
         mode = "HEURISTIC"
     if use_optical_flow:
-        mode += f"+FLOW(b={flow_beta:.2f})"
+        mode += f"+{'RAFT' if use_raft_flow else 'Farneback'}FLOW(b={flow_beta:.2f})"
 
     print(f"[{mode}] Opening video: {input_path}")
     cap = cv2.VideoCapture(str(input_path))
@@ -279,9 +338,12 @@ def add_text_watermark_to_video(
     box_w = text_w + 20
     box_h = text_h + 20
 
-    saliency_model = None
+    saliency_model_instance = None
     if use_saliency_model:
-        saliency_model = DeepLabSaliency()
+        if saliency_type == "u2net" and U2NetSaliency is not None:
+            saliency_model_instance = U2NetSaliency()
+        else:
+            saliency_model_instance = DeepLabSaliency()
 
     prev_x, prev_y = None, None
     max_jump_sq = max_jump * max_jump
@@ -300,23 +362,26 @@ def add_text_watermark_to_video(
         lap_map = compute_complexity_map(frame)
 
         if use_hybrid:
-            # Ensure DeepLab model exists
-            if saliency_model is None:
-                saliency_model = DeepLabSaliency()
-            dl_map = saliency_model.get_saliency_map(frame)
+            if saliency_model_instance is None:
+                saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
+            dl_map = saliency_model_instance.get_saliency_map(frame)
             guide_map = combine_maps(lap_map, dl_map, w_deeplab=w_deeplab)
 
         elif use_saliency_model:
-            if saliency_model is None:
-                saliency_model = DeepLabSaliency()
-            guide_map = saliency_model.get_saliency_map(frame)
+            if saliency_model_instance is None:
+                saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
+            guide_map = saliency_model_instance.get_saliency_map(frame)
 
         else:
             guide_map = lap_map
             
-        # --- Optical-flow temporal consistency ---
+        # --- Optical-flow temporal consistency (proposal: RAFT) ---
         if use_optical_flow and prev_frame is not None and prev_guide_map is not None:
-            flow = compute_flow_farneback(prev_frame, frame)
+            flow = None
+            if use_raft_flow:
+                flow = compute_flow_raft(prev_frame, frame)
+            if flow is None:
+                flow = compute_flow_farneback(prev_frame, frame)
             prev_warped = warp_map_with_flow(prev_guide_map, flow)
 
             b = float(np.clip(flow_beta, 0.0, 1.0))
@@ -355,11 +420,28 @@ def add_text_watermark_to_video(
 
         prev_x, prev_y = x, y
         
+        # DCT-based invisible watermark (proposal: hybrid DCT embedding)
+        # Place DCT AWAY from visible text to avoid overlay corrupting coefficients
+        if embed_dct_watermark is not None and embed_dct_payload:
+            dct_sz = max(64, (dct_roi_size // 8) * 8)
+            # Prefer: right of text box, else below, else opposite corner
+            dct_x = x + box_w + 24
+            dct_y = y
+            if dct_x + dct_sz > width:
+                dct_x = max(0, width - dct_sz - 20)
+                dct_y = y + box_h + 16 if y + box_h + dct_sz <= height else max(0, height - dct_sz - 20)
+            elif dct_y + dct_sz > height:
+                dct_y = max(0, height - dct_sz - 20)
+            dct_roi = (dct_x, dct_y, dct_sz, dct_sz)
+            frame = embed_dct_watermark(frame, embed_dct_payload, dct_roi, strength=dct_strength, use_ecc=False)
+        else:
+            dct_roi = None
+
         if save_positions:
             t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
-            positions.append({
+            pos_entry = {
                 "frame": int(frame_idx),
-                "t_ms": t_ms,                      # ✅ ADD THIS
+                "t_ms": t_ms,
                 "x": int(x),
                 "y": int(y),
                 "box_w": int(box_w),
@@ -373,7 +455,13 @@ def add_text_watermark_to_video(
                 "alpha": float(alpha),
                 "font_scale": float(font_scale),
                 "thickness": int(thickness),
-            })
+            }
+            if dct_roi is not None:
+                pos_entry["dct_roi"] = {"x": dct_roi[0], "y": dct_roi[1], "w": dct_roi[2], "h": dct_roi[3]}
+                # Store original payload (hex) for BER evaluation under attacks (first frame only)
+                if embed_dct_payload and not any("original_dct_payload_hex" in p for p in positions):
+                    pos_entry["original_dct_payload_hex"] = embed_dct_payload.hex()
+            positions.append(pos_entry)
 
         overlay = frame.copy()
         text_x = x + 10

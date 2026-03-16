@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Ensure project root is on path
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,11 +99,49 @@ def convert_to_h264_for_preview(src: Path, dst: Path) -> bool:
         return False
 
 
+def _apply_neural_on_video(src: Path, dst: Path, payload_bits: list[int], model_dir: Path) -> bool:
+    """Apply neural watermark on existing video. Returns True if successful."""
+    enc_p = model_dir / "encoder.pt"
+    dec_p = model_dir / "decoder.pt"
+    if not enc_p.exists() or not dec_p.exists():
+        return False
+    try:
+        from src.neural_watermark.embed import NeuralWatermarker
+        import torch
+        wm = NeuralWatermarker(encoder_path=enc_p, decoder_path=dec_p,
+            device="cuda" if torch.cuda.is_available() else "cpu")
+        cap = cv2.VideoCapture(str(src))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(dst), fourcc, fps, (w, h))
+        n = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = wm.embed(frame, payload_bits)
+            out.write(frame)
+            n += 1
+        cap.release()
+        out.release()
+        return n > 0
+    except Exception:
+        return False
+
+
 def run_watermark(method: str, input_path: Path, output_path: Path, positions_path: Path,
                   text: str, alpha: float, w_deeplab: float,
-                  prefer_edges: bool = True, edge_margin: float = 0.12) -> None:
+                  prefer_edges: bool = True, edge_margin: float = 0.12,
+                  embed_dct_payload: Optional[bytes] = None,
+                  use_neural: bool = False,
+                  neural_payload_bits: Optional[list[int]] = None,
+                  saliency_type: str = "deeplab",
+                  use_optical_flow: bool = False, use_raft_flow: bool = False) -> None:
     ensure_dirs()
-    if method == "Fixed":
+    model_dir = ROOT / "data" / "models" / "neural_wm"
+
+    if method == "Fixed" and not embed_dct_payload and not use_neural:
         add_text_watermark_fixed(
             input_path=input_path,
             output_path=output_path,
@@ -112,23 +151,43 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
             positions_path=positions_path,
         )
     else:
+        use_hybrid = method == "Hybrid"
+        use_saliency = method in ("DeepLab", "Hybrid")
         add_text_watermark_to_video(
             input_path=input_path,
             output_path=output_path,
             text=text,
             alpha=alpha,
-            use_saliency_model=(method in ("DeepLab", "Hybrid")),
-            use_hybrid=(method == "Hybrid"),
+            use_saliency_model=use_saliency,
+            use_hybrid=use_hybrid,
             w_deeplab=w_deeplab,
             temporal_smoothing=True,
             temporal_alpha=0.8,
             max_jump=150,
-            use_optical_flow=False,
+            use_optical_flow=use_optical_flow,
+            use_raft_flow=use_raft_flow,
             save_positions=True,
             positions_path=positions_path,
             prefer_edges=prefer_edges,
             edge_margin=edge_margin,
+            embed_dct_payload=embed_dct_payload,
+            saliency_type=saliency_type,
         )
+
+    # Apply neural on top if requested
+    if use_neural and neural_payload_bits and model_dir.exists():
+        tmp = output_path.parent / (output_path.stem + "_tmp.mp4")
+        output_path.rename(tmp)
+        if _apply_neural_on_video(tmp, output_path, neural_payload_bits, model_dir):
+            tmp.unlink(missing_ok=True)
+            # Save neural payload in positions for detection
+            if positions_path.exists():
+                data = json.loads(positions_path.read_text(encoding="utf-8"))
+                if data:
+                    data[0]["neural_payload_bits"] = neural_payload_bits
+                    positions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        else:
+            tmp.rename(output_path)
 
 
 def main():
@@ -159,6 +218,32 @@ def main():
             index=3,
             help="Fixed: bottom-right. Heuristic: Laplacian. DeepLab: semantic. Hybrid: Laplacian+DeepLab.",
         )
+        saliency_type = st.selectbox(
+            "Saliency model (Hybrid/DeepLab)",
+            ["deeplab", "u2net"],
+            index=0,
+            help="U²-Net: proposal-aligned salient object detection. DeepLab: semantic segmentation.",
+        )
+        use_optical_flow = st.checkbox(
+            "Use optical flow (temporal consistency)",
+            value=False,
+            help="Farneback by default. Enable RAFT below for proposal-aligned flow.",
+        )
+        use_raft_flow = False
+        if use_optical_flow:
+            use_raft_flow = st.checkbox(
+                "Use RAFT optical flow (proposal)",
+                value=False,
+                help="RAFT instead of Farneback. Requires more GPU memory.",
+            )
+
+        st.subheader("Watermark types")
+        use_visible = st.checkbox("Visible (text overlay)", value=True,
+            help="Semi-transparent text on video. Always recommended for traceability.")
+        use_dct = st.checkbox("DCT (invisible, in ROI)", value=False,
+            help="Embed payload in DCT coefficients. Robust to compression. Requires traceability or custom ID.")
+        use_neural = st.checkbox("Neural (invisible, full-frame)", value=False,
+            help="Learning-based invisible watermark. Requires trained encoder/decoder in data/models/neural_wm/.")
 
         st.subheader("Traceability (Phase 2)")
         use_traceability = st.checkbox(
@@ -174,8 +259,13 @@ def main():
                 help="Short hash instead of raw ID. Requires lookup table to trace back.")
             text = encode_fingerprint(user_id, location or None, device or None, use_hash=use_hash)
             st.caption(f"Watermark text: **{text}**")
+            if use_dct and not user_id:
+                st.caption(":warning: DCT requires User ID.")
         else:
             text = st.text_input("Watermark text", value="VideoWaterMarker")
+            user_id = ""
+            location = ""
+            device = ""
 
         alpha = st.slider("Opacity", 0.2, 1.0, 0.5)
         w_deeplab = 0.6
@@ -189,6 +279,25 @@ def main():
         if prefer_edges:
             edge_margin = st.slider("Edge margin", 0.08, 0.25, 0.12, 0.01,
                 help="Fraction of frame width/height for edge zone (larger = stricter).")
+
+    # Build DCT payload (needs user_id or text for encoding)
+    embed_dct_payload = None
+    if use_dct and (user_id or text):
+        try:
+            from src.crypto_payload import encode_payload
+            payload_bytes, _ = encode_payload(
+                user_id or text, None, location or None, device or None,
+                use_aes=False, use_ecc=True,
+            )
+            embed_dct_payload = payload_bytes
+        except ImportError:
+            pass
+
+    # Neural payload: 8 bits from hash of user_id or text
+    neural_payload_bits = None
+    if use_neural:
+        h = hash((user_id or text) or "default") & 0xFF
+        neural_payload_bits = [(h >> i) & 1 for i in range(8)]
 
     # --- Main: Tabs ---
     input_path_raw = st.session_state.get(INPUT_PATH)
@@ -217,6 +326,12 @@ def main():
                             w_deeplab=w_deeplab,
                             prefer_edges=prefer_edges,
                             edge_margin=edge_margin,
+                            embed_dct_payload=embed_dct_payload,
+                            use_neural=use_neural,
+                            neural_payload_bits=neural_payload_bits,
+                            saliency_type=saliency_type,
+                            use_optical_flow=use_optical_flow,
+                            use_raft_flow=use_raft_flow,
                         )
                         st.session_state[OUTPUT_PATH] = str(output_path)
                         st.session_state[POSITIONS_PATH] = str(positions_path)
@@ -255,12 +370,28 @@ def main():
                     )
                 with open(src, "rb") as f:
                     st.download_button("Download watermarked video", f, file_name=src.name, mime="video/mp4")
+                pos_data = {}
+                for pp in [positions_path, APP_OUTPUT / "positions_manual.json", APP_OUTPUT / "positions.json"]:
+                    if pp.exists():
+                        try:
+                            pos_data = json.loads(pp.read_text(encoding="utf-8"))
+                            break
+                        except Exception:
+                            pass
+                has_dct = bool(pos_data and pos_data[0].get("dct_roi"))
+                has_neural = bool(pos_data and pos_data[0].get("neural_payload_bits"))
+                wm_list = ["Visible"]
+                if has_dct:
+                    wm_list.append("DCT")
+                if has_neural:
+                    wm_list.append("Neural")
                 summary = f"""Video Watermarking Summary
 =========================
 Method: {method}
 Watermark text: {text}
 Opacity: {alpha}
 Output: {src.name}
+Watermarks applied: {", ".join(wm_list)}
 Prefer edges: {prefer_edges}
 Edge margin: {edge_margin}
 """
@@ -474,14 +605,25 @@ Edge margin: {edge_margin}
 
                     st.metric("Detection rate", f"{result['rate']:.1f}%")
                     st.metric("Embedded fingerprint", text)
+                    if result.get("dct_payload"):
+                        try:
+                            from src.crypto_payload import decode_payload
+                            decoded = decode_payload(result["dct_payload"], use_aes=False, use_ecc=True)
+                            if decoded:
+                                st.metric("DCT payload (decoded)", decoded)
+                        except Exception:
+                            st.caption("DCT payload extracted (decode failed)")
                     st.caption("The fingerprint text identifies which user/session the video originated from.")
                     with st.expander("Details"):
-                        st.json({
+                        det = {
                             "frames_sampled": result["total"],
                             "frames_detected": result["hit"],
                             "mean_ncc": round(result["mean"], 4),
                             "threshold": thr,
-                        })
+                        }
+                        if result.get("dct_payload"):
+                            det["dct_extracted"] = True
+                        st.json(det)
                 except Exception as e:
                     st.error(str(e))
 
@@ -556,12 +698,17 @@ Edge margin: {edge_margin}
         ## User-Specific Fingerprint (Traceability)
 
         When **traceability mode** is enabled, each user receives a video with a **unique watermark**.
-        If the video is leaked or pirated, the visible code can be traced back to the source account.
+        If the video is leaked or pirated, the watermark can be traced back to the source account.
+
+        ### Watermark types
+        - **Visible**: Semi-transparent text overlay. Robust, easy to detect.
+        - **DCT**: Invisible payload in DCT coefficients (Reed-Solomon). Robust to compression.
+        - **Neural**: Learning-based invisible watermark. Requires trained models in `data/models/neural_wm/`.
 
         ### Flow
         1. **OTT/Streaming platform** assigns a user ID (and optionally location, device) to each session.
-        2. **Watermarking** embeds this as visible text (e.g. `ID:user_001` or `ID:a1b2c3d4`).
-        3. **Piracy detection**: Found copy → read watermark text → lookup in registry → identify user.
+        2. **Watermarking** embeds this as visible text and/or invisible DCT/neural payloads.
+        3. **Piracy detection**: Found copy → detect/extract watermarks → lookup in registry → identify user.
 
         ### Modes
         - **Direct ID**: Short user IDs shown as-is (`ID:alice`, `ID:user_001`). Best for demos.

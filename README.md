@@ -1,17 +1,22 @@
 # VideoWaterMarker
 
-**Model-guided adaptive video watermarking** — Master's Project, CSU Sacramento
+**Deep Learning–Based Video Watermarking for OTT Piracy Prevention** — Master's Project, CSU Sacramento
 
-Places semi-transparent text watermarks in **less intrusive regions** of each video frame using Laplacian complexity + DeepLab semantic saliency, with user-specific fingerprinting for traceability.
+Model-guided adaptive video watermarking combining:
+- **Saliency detection** (Laplacian + DeepLab) for low-attention placement
+- **Visible + invisible (DCT)** watermarks per proposal
+- **AES-GCM + Reed-Solomon** encrypted payload for forensic traceability
+- **Optical flow** (Farneback or RAFT) for temporal consistency
 
 ---
 
 ## What This Does
 
-1. **Watermarks videos** — Adds semi-transparent text (e.g. `VideoWaterMarker` or user ID) to video frames.
+1. **Watermarks videos** — Adds semi-transparent text + optional **invisible DCT watermark** (proposal-aligned).
 2. **Smart placement** — Chooses low-complexity, low-saliency regions (avoids faces, objects, text).
-3. **Detects watermarks** — Confirms presence of the watermark in original or attacked videos.
-4. **Traceability** — Embeds user ID in the watermark so leaked copies can be traced back.
+3. **Forensic payload** — AES-GCM encryption + Reed-Solomon ECC for session ID robustness.
+4. **Detects watermarks** — Template matching (visible) + DCT extraction (invisible).
+5. **Traceability** — Embeds user/session ID; leaked copies can be traced back.
 
 ---
 
@@ -42,7 +47,7 @@ The Streamlit app has **6 tabs**:
   - **Heuristic** — Laplacian complexity (smooth regions).
   - **DeepLab** — Semantic saliency (avoids foreground).
   - **Hybrid** — Laplacian + DeepLab combined (recommended).
-- **Traceability (optional):** Enable and enter User ID, Location, Device to embed a unique fingerprint.
+- **Traceability (optional):** Enable and enter User ID, Location, Device; optionally embed **invisible DCT** with Reed-Solomon.
 - **Placement:** Prefer edges/corners (default) to reduce intrusion and improve crop resilience.
 - Click **Generate** to create the watermarked video.
 
@@ -64,6 +69,7 @@ The Streamlit app has **6 tabs**:
 - Run detection to get:
   - **Detection rate** — % of frames where watermark was found.
   - **Embedded fingerprint** — The text in the watermark (e.g. `ID:user_001`).
+  - **DCT payload** — Invisible payload (user/session ID) when enabled.
 - Works with **previous files** — no need to generate in this session.
 
 ### 5. Attack Test
@@ -85,7 +91,7 @@ The Streamlit app has **6 tabs**:
 | **Fixed** | Constant bottom-right position. Simple baseline.                            |
 | **Heuristic** | Laplacian edge map → low-complexity (smooth) regions.                       |
 | **DeepLab** | DeepLabV3-ResNet50 segmentation → avoids foreground objects.              |
-| **Hybrid** | Combines Laplacian + DeepLab with weighted fusion. Best balance.           |
+| **Hybrid** | Combines Laplacian + DeepLab (or U²-Net) with weighted fusion. Best balance. |
 
 All adaptive methods use temporal smoothing (EMA) to avoid jitter between frames.
 
@@ -130,6 +136,26 @@ python -m src.demo_fingerprint --input video.mp4 --users user_001 user_002 alice
 
 **Run full benchmark** (see `src/runner/run_benchmark.py`).
 
+**Run FastAPI microservice** (OTT pipeline):
+```bash
+uvicorn src.api_watermark:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+**Baseline comparison** (VideoSeal / ItoV):
+```bash
+python -m src.baselines.run_baseline_comparison --clean video.mp4 --ours out/watermarked.mp4 --out_csv baseline.csv
+```
+
+**Neural encoder-decoder training**:
+```bash
+python -m src.neural_watermark.train --data_dir data/input --epochs 50
+```
+
+**HLS segment watermarking**:
+```bash
+python -m src.hls_watermark --manifest path/to/playlist.m3u8 --output data/hls_watermarked
+```
+
 ---
 
 ## Project Structure
@@ -147,14 +173,29 @@ VideoWaterMarker/
 │   └── output/            # Watermarked outputs (gitignored)
 └── src/
     ├── app_watermark_ui.py    # Main Streamlit app
+    ├── api_watermark.py       # FastAPI microservice (OTT)
     ├── video_watermark_demo.py# Watermarking logic
     ├── detect_watermark.py    # Detection logic
     ├── fingerprint.py         # User ID encoding
+    ├── crypto_payload.py     # AES-GCM + Reed-Solomon payload
+    ├── dct_watermark.py       # Invisible DCT embedding
+    ├── evaluate_ber.py       # BER / recovery metrics
     ├── run_attacks.py        # Apply distortion attacks
     ├── run_attacks_ui.py     # Attack runner for UI
     ├── demo_fingerprint.py   # CLI fingerprint demo
-    └── models/
-        └── saliency_deeplab.py  # DeepLabV3-ResNet50 wrapper
+    ├── models/
+    │   └── saliency_deeplab.py  # DeepLabV3-ResNet50 wrapper
+    ├── models/
+    │   ├── saliency_deeplab.py
+    │   ├── saliency_u2net.py   # U²-Net saliency (proposal)
+    │   └── u2net.py
+    ├── neural_watermark/      # Neural encoder-decoder (proposal)
+    │   ├── models.py
+    │   ├── train.py
+    │   └── embed.py
+    ├── hls_watermark.py        # HLS/DASH segment watermarking
+    └── baselines/             # VideoSeal / ItoV comparison
+        └── run_baseline_comparison.py
 ```
 
 ---
@@ -173,6 +214,8 @@ pandoc docs/REPORT.md -o docs/REPORT.pdf --pdf-engine=xelatex -V geometry:margin
 
 - Python 3.10+
 - OpenCV, NumPy, PyTorch, torchvision, Streamlit
+- pycryptodome, reedsolo (AES-GCM + Reed-Solomon)
+- fastapi, uvicorn (for API microservice)
 - ffmpeg (optional, for video preview and attack testing)
 
 ---

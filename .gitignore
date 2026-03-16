@@ -9,6 +9,12 @@ Thumbs.db
 .vscode/
 .idea/
 
+# model weights (large)
+data/models/
+
+# batch eval outputs
+data/attacks_batch/
+
 # data outputs (DON'T COMMIT)
 data/_tmp_xiph/
 data/clips_xiph_hd/

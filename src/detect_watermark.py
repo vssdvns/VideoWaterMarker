@@ -4,9 +4,15 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
+
+try:
+    from .dct_watermark import extract_dct_watermark
+except ImportError:
+    extract_dct_watermark = None
 
 
 def build_time_index(positions):
@@ -103,7 +109,7 @@ def detect_video(
     thr=0.35,
     enable_global_fallback=True,
     global_downscale=0.5,
-):
+) -> dict:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(video_path)
@@ -115,6 +121,9 @@ def detect_video(
     scores = []
     total = 0
     hit = 0
+    dct_payload: Optional[bytes] = None
+    has_dct_roi = bool(positions and positions[0].get("dct_roi"))
+    dct_strength = 5.0
 
     idx = 0
     while True:
@@ -163,15 +172,28 @@ def detect_video(
         if best_score >= thr:
             hit += 1
 
+        # DCT payload extraction (invisible watermark)
+        if extract_dct_watermark is not None and has_dct_roi and dct_payload is None:
+            roi_info = positions[pos_idx].get("dct_roi", {})
+            if roi_info:
+                rx = int(roi_info.get("x", 0))
+                ry = int(roi_info.get("y", 0))
+                rw = int(roi_info.get("w", 64))
+                rh = int(roi_info.get("h", 64))
+                roi = (rx, ry, rw, rh)
+                extracted = extract_dct_watermark(frame, roi, strength=dct_strength, use_ecc=False)
+                if extracted and len(extracted) > 0:
+                    dct_payload = extracted
+
         idx += 1
 
     cap.release()
 
     if total == 0:
-        return {"total": 0, "hit": 0, "rate": 0.0, "mean": 0.0, "p50": 0.0, "p10": 0.0, "p90": 0.0}
+        return {"total": 0, "hit": 0, "rate": 0.0, "mean": 0.0, "p50": 0.0, "p10": 0.0, "p90": 0.0, "dct_payload": None}
 
     scores_np = np.array(scores, dtype=np.float32)
-    return {
+    result = {
         "total": total,
         "hit": hit,
         "rate": 100.0 * hit / total,
@@ -180,6 +202,11 @@ def detect_video(
         "p50": float(np.percentile(scores_np, 50)),
         "p90": float(np.percentile(scores_np, 90)),
     }
+    if dct_payload is not None:
+        result["dct_payload"] = dct_payload
+    else:
+        result["dct_payload"] = None
+    return result
 
 
 def main():

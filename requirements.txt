@@ -2,6 +2,17 @@
 opencv-python>=4.8.0
 numpy>=1.24.0
 torch>=2.0.0
-torchvision>=0.15.0
+torchvision>=0.15.0  # RAFT optical flow (0.14+)
 streamlit>=1.28.0
 pandas>=2.0.0
+scikit-image>=0.20.0
+lpips>=0.1.4
+
+# Proposal-aligned: AES-GCM + Reed-Solomon for forensic payload
+pycryptodome>=3.19.0
+reedsolo>=1.7.0
+
+# FastAPI microservice (OTT pipeline integration)
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
