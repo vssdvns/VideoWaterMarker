@@ -200,7 +200,24 @@ def embed_dct_watermark(
 
     modified = _embed_payload_in_region(region, bits, strength=strength)
     out = frame.copy()
-    out[y : y + h, x : x + w] = modified
+    # Feather ROI boundary to avoid visible seam (blend outer pixels with original)
+    feat = min(4, w // 8, h // 8)
+    if feat > 0 and region.ndim == 3:
+        orig_roi = frame[y : y + h, x : x + w].astype(np.float32)
+        mod_f = modified.astype(np.float32)
+        yy = np.arange(h)[:, np.newaxis]
+        xx = np.arange(w)[np.newaxis, :]
+        dist_top = yy
+        dist_bot = h - 1 - yy
+        dist_left = xx
+        dist_right = w - 1 - xx
+        alpha_y = np.minimum(np.minimum(dist_top, dist_bot) / feat, 1.0)
+        alpha_x = np.minimum(np.minimum(dist_left, dist_right) / feat, 1.0)
+        mask_2d = np.minimum(alpha_y, alpha_x)[:, :, np.newaxis]
+        blended = (mask_2d * mod_f + (1 - mask_2d) * orig_roi).clip(0, 255).astype(np.uint8)
+        out[y : y + h, x : x + w] = blended
+    else:
+        out[y : y + h, x : x + w] = modified
     return out
 
 

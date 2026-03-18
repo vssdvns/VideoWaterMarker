@@ -137,20 +137,35 @@ class Decoder(nn.Module):
 class AttackSimulator(nn.Module):
     """
     Differentiable attack simulation for training.
-    Applies: JPEG-like, blur, noise, resize.
+    Applies: blur, noise, resize (down-up). Matches real-world attacks better.
     """
 
-    def __init__(self, jpeg_quality: float = 0.5, blur_sigma: float = 0.5, noise_std: float = 0.02) -> None:
+    def __init__(
+        self,
+        jpeg_quality: float = 0.5,
+        blur_sigma: float = 0.5,
+        noise_std: float = 0.02,
+        resize_scale: float = 0.0,
+    ) -> None:
         super().__init__()
         self.jpeg_quality = jpeg_quality
         self.blur_sigma = blur_sigma
         self.noise_std = noise_std
+        self.resize_scale = resize_scale  # 0 = off, else e.g. 0.5 = resize to 50% then back
 
     def forward(
         self, x: torch.Tensor, training: bool = True
     ) -> torch.Tensor:
         if not training:
             return x
+        # Resize down-up (mimics down_up attack; ~50% prob when enabled)
+        if self.resize_scale > 0 and x.shape[2] > 16:
+            # Randomly apply resize to increase robustness to re-encoding/crop
+            if torch.rand(1, device=x.device).item() < 0.4:
+                h, w = x.shape[2], x.shape[3]
+                nh, nw = max(8, int(h * self.resize_scale)), max(8, int(w * self.resize_scale))
+                x = torch.nn.functional.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
+                x = torch.nn.functional.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
         # Blur (approx with conv)
         if self.blur_sigma > 0:
             k = 5

@@ -195,6 +195,8 @@ def main():
         help="Attack blur strength (0.35 gentler than 0.5)")
     ap.add_argument("--noise_std", type=float, default=0.015,
         help="Attack noise std (0.015 gentler than 0.02)")
+    ap.add_argument("--resize_scale", type=float, default=0.0,
+        help="Resize-down-up attack scale (0.5 = 50%% then back; 0 = off)")
     ap.add_argument("--fast", action="store_true",
         help="Fast preset: 8 bits, 100 frames, size 64, no attacks, phase0=40, ~20–30min for 100 epochs")
     ap.add_argument("--improved", action="store_true",
@@ -224,7 +226,7 @@ def main():
         args.delta_weight = 1.0
         print("[TRAIN] Fast mode: 8 bits, 100 frames, size 64, no attacks, phase0=40, delta_w=1.0")
 
-    # Improved preset: 8 bits, 180–200 ep, gentle attack curriculum, low MSE early
+    # Improved preset: 8 bits, 180–200 ep, gentle attack curriculum, low MSE early, resize attack
     if args.improved:
         args.payload_bits = 8
         args.epochs = max(args.epochs, 180)
@@ -234,7 +236,8 @@ def main():
         args.size = min(args.size, 128)
         args.blur_sigma = 0.25
         args.noise_std = 0.01
-        print("[TRAIN] Improved: 8 bits, 180 ep, phase0=40, phase1=60, phase2=80, gentle attacks, low MSE")
+        args.resize_scale = 0.5
+        print("[TRAIN] Improved: 8 bits, 180 ep, phase0=40, phase1=60, phase2=80, gentle attacks, resize 0.5")
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -281,7 +284,7 @@ def main():
     enc = Encoder(payload_bits=payload_bits).to(device)
     dec = Decoder(payload_bits=payload_bits).to(device)
     dec_delta = DecoderDelta(payload_bits=payload_bits).to(device)
-    attack = AttackSimulator(blur_sigma=args.blur_sigma, noise_std=args.noise_std).to(device)
+    attack = AttackSimulator(blur_sigma=args.blur_sigma, noise_std=args.noise_std, resize_scale=args.resize_scale).to(device)
 
     lr0 = args.lr_phase0
     enc_opt = torch.optim.Adam(enc.parameters(), lr=lr0)

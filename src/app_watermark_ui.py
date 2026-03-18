@@ -53,6 +53,30 @@ APP_INPUT = APP_DIR / "input"
 APP_OUTPUT = APP_DIR / "output"
 
 
+def _hamming_distance_8(a: int, b: int) -> int:
+    """Number of differing bits between two 8-bit values."""
+    x = (a ^ b) & 0xFF
+    return bin(x).count("1")
+
+
+def _lookup_fingerprint(extracted_id: int, registry: dict, max_distance: int = 2) -> list[tuple[str, int]]:
+    """
+    Find registry entries whose fingerprint is within max_distance (Hamming) of extracted_id.
+    Returns [(user_id, distance), ...] sorted by distance.
+    """
+    results = []
+    for fid_str, user_id in registry.items():
+        try:
+            fid = int(fid_str) if isinstance(fid_str, str) and fid_str.isdigit() else int(fid_str, 16 if "x" in str(fid_str).lower() else 10)
+        except (ValueError, TypeError):
+            continue
+        fid &= 0xFF
+        d = _hamming_distance_8(extracted_id, fid)
+        if d <= max_distance:
+            results.append((str(user_id), d))
+    return sorted(results, key=lambda x: x[1])
+
+
 def ensure_dirs():
     APP_INPUT.mkdir(parents=True, exist_ok=True)
     APP_OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -99,30 +123,46 @@ def convert_to_h264_for_preview(src: Path, dst: Path) -> bool:
         return False
 
 
-def _apply_neural_on_video(src: Path, dst: Path, payload_bits: list[int], model_dir: Path) -> bool:
+def _apply_neural_on_video(
+    src: Path,
+    dst: Path,
+    payload_bits: list[int],
+    model_dir: Path,
+    color_mode: str = "luma_only",
+    delta_scale: float = 0.04,
+    delta_smooth_sigma: float = 1.0,
+    progress_callback=None,
+) -> bool:
     """Apply neural watermark on existing video. Returns True if successful."""
     enc_p = model_dir / "encoder.pt"
     dec_p = model_dir / "decoder.pt"
     if not enc_p.exists() or not dec_p.exists():
         return False
     try:
+        import time
         from src.neural_watermark.embed import NeuralWatermarker
         import torch
         wm = NeuralWatermarker(encoder_path=enc_p, decoder_path=dec_p,
-            device="cuda" if torch.cuda.is_available() else "cpu")
+            device="cuda" if torch.cuda.is_available() else "cpu", delta_scale=delta_scale)
         cap = cv2.VideoCapture(str(src))
         fps = cap.get(cv2.CAP_PROP_FPS)
         w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(str(dst), fourcc, fps, (w, h))
-        n = 0
+        n, t_start = 0, time.perf_counter()
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame = wm.embed(frame, payload_bits)
+            frame = wm.embed(frame, payload_bits, color_mode=color_mode, delta_scale=delta_scale,
+                             delta_smooth_sigma=delta_smooth_sigma)
             out.write(frame)
             n += 1
+            if progress_callback and n % 5 == 0 and frame_count > 0:
+                elapsed = time.perf_counter() - t_start
+                eta = (elapsed / n) * (frame_count - n) if n > 0 else 0
+                progress_callback(n, frame_count, "neural", eta)
         cap.release()
         out.release()
         return n > 0
@@ -134,12 +174,27 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
                   text: str, alpha: float, w_deeplab: float,
                   prefer_edges: bool = True, edge_margin: float = 0.12,
                   embed_dct_payload: Optional[bytes] = None,
+                  use_visible: bool = True,
                   use_neural: bool = False,
                   neural_payload_bits: Optional[list[int]] = None,
+                  neural_color_mode: str = "luma_only",
+                  neural_delta_scale: float = 0.04,
+                  neural_delta_smooth_sigma: float = 1.0,
                   saliency_type: str = "deeplab",
-                  use_optical_flow: bool = False, use_raft_flow: bool = False) -> None:
+                  use_optical_flow: bool = False, use_raft_flow: bool = False,
+                  progress_callback=None) -> None:
     ensure_dirs()
     model_dir = ROOT / "data" / "models" / "neural_wm"
+
+    # Neural-only path: no visible text, no DCT — apply neural directly to input
+    if not use_visible and not embed_dct_payload and use_neural and neural_payload_bits and model_dir.exists():
+        if _apply_neural_on_video(input_path, output_path, neural_payload_bits, model_dir, neural_color_mode, neural_delta_scale, neural_delta_smooth_sigma, progress_callback):
+            positions_path.parent.mkdir(parents=True, exist_ok=True)
+            positions_path.write_text(
+                json.dumps([{"neural_payload_bits": neural_payload_bits}], indent=2),
+                encoding="utf-8",
+            )
+        return
 
     if method == "Fixed" and not embed_dct_payload and not use_neural:
         add_text_watermark_fixed(
@@ -172,13 +227,16 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
             edge_margin=edge_margin,
             embed_dct_payload=embed_dct_payload,
             saliency_type=saliency_type,
+            draw_visible_text=use_visible,
+            progress_callback=progress_callback,
         )
 
     # Apply neural on top if requested
     if use_neural and neural_payload_bits and model_dir.exists():
         tmp = output_path.parent / (output_path.stem + "_tmp.mp4")
+        tmp.unlink(missing_ok=True)
         output_path.rename(tmp)
-        if _apply_neural_on_video(tmp, output_path, neural_payload_bits, model_dir):
+        if _apply_neural_on_video(tmp, output_path, neural_payload_bits, model_dir, neural_color_mode, neural_delta_scale, neural_delta_smooth_sigma, progress_callback):
             tmp.unlink(missing_ok=True)
             # Save neural payload in positions for detection
             if positions_path.exists():
@@ -222,7 +280,7 @@ def main():
             "Saliency model (Hybrid/DeepLab)",
             ["deeplab", "u2net"],
             index=0,
-            help="U²-Net: proposal-aligned salient object detection. DeepLab: semantic segmentation.",
+            help="DeepLab: heavier (~40M params). U²-Net: lighter (~4.7M params), needs u2netp.pth.",
         )
         use_optical_flow = st.checkbox(
             "Use optical flow (temporal consistency)",
@@ -244,6 +302,32 @@ def main():
             help="Embed payload in DCT coefficients. Robust to compression. Requires traceability or custom ID.")
         use_neural = st.checkbox("Neural (invisible, full-frame)", value=False,
             help="Learning-based invisible watermark. Requires trained encoder/decoder in data/models/neural_wm/.")
+        neural_color_mode = "luma_only"
+        neural_delta_scale = 0.04
+        if use_neural:
+            neural_color_mode = st.selectbox(
+                "Neural color preservation",
+                options=["luma_only", "bias_corrected", "rgb"],
+                format_func=lambda x: {
+                    "luma_only": "Luminance only (best – preserves colors exactly)",
+                    "bias_corrected": "Bias-corrected (reduces color cast)",
+                    "rgb": "Full RGB (may shift colors)",
+                }[x],
+                index=0,
+                help="Luminance only: no color shift. Lower strength = better quality.",
+            )
+            neural_delta_scale = st.slider(
+                "Neural strength (lower = better quality, less robust)",
+                0.02, 0.12, 0.04, 0.01,
+                help="0.04 = high quality. 0.06+ = more robust to attacks.",
+            )
+            neural_delta_smooth_sigma = st.slider(
+                "Delta smoothing (reduces haloing around edges)",
+                0.0, 2.5, 1.0, 0.1,
+                help="Light blur on delta to soften shadow-like padding around branches. 0 = off.",
+            )
+        else:
+            neural_delta_smooth_sigma = 1.0
 
         st.subheader("Traceability (Phase 2)")
         use_traceability = st.checkbox(
@@ -299,11 +383,22 @@ def main():
         h = hash((user_id or text) or "default") & 0xFF
         neural_payload_bits = [(h >> i) & 1 for i in range(8)]
 
+    # --- Output filename ---
+    output_basename = st.text_input(
+        "Output filename (without .mp4)",
+        value="watermarked",
+        placeholder="watermarked",
+        help="Saved as <name>.mp4. Default overwrites previous watermarked video.",
+    )
+    base = (output_basename or "watermarked").strip().replace(".mp4", "")
+    output_name = base + ".mp4"
+    positions_name = "positions.json" if base == "watermarked" else base + "_positions.json"
+
     # --- Main: Tabs ---
     input_path_raw = st.session_state.get(INPUT_PATH)
     input_path = Path(input_path_raw) if input_path_raw and Path(input_path_raw).exists() else None
-    output_path = APP_OUTPUT / "watermarked.mp4"
-    positions_path = APP_OUTPUT / "positions.json"
+    output_path = APP_OUTPUT / output_name
+    positions_path = APP_OUTPUT / positions_name
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         ["Generate", "Preview", "Manual adjust", "Detect (no generate)", "Attack test", "Traceability info"]
@@ -314,31 +409,49 @@ def main():
             st.info("👆 Upload a video in the sidebar to start.")
         else:
             if st.button("🚀 Generate watermarked video"):
-                with st.spinner("Generating watermarked video... (this may take a minute)"):
-                    try:
-                        run_watermark(
-                            method=method,
-                            input_path=input_path,
-                            output_path=output_path,
-                            positions_path=positions_path,
-                            text=text,
-                            alpha=alpha,
-                            w_deeplab=w_deeplab,
-                            prefer_edges=prefer_edges,
-                            edge_margin=edge_margin,
-                            embed_dct_payload=embed_dct_payload,
-                            use_neural=use_neural,
-                            neural_payload_bits=neural_payload_bits,
-                            saliency_type=saliency_type,
-                            use_optical_flow=use_optical_flow,
-                            use_raft_flow=use_raft_flow,
-                        )
-                        st.session_state[OUTPUT_PATH] = str(output_path)
-                        st.session_state[POSITIONS_PATH] = str(positions_path)
-                        st.session_state[VIDEO_READY] = True
-                        st.success("Done! Check the Preview tab.")
-                    except Exception as e:
-                        st.error(str(e))
+                prog = st.progress(0, text="Starting...")
+                status = st.caption("")
+                phase_offset = {"visible+dct": 0.0, "neural": 0.5}
+                def on_progress(current: int, total: int, phase: str, eta_sec: float):
+                    if total > 0:
+                        pct = current / total
+                        base = phase_offset.get(phase, 0.0)
+                        span = 0.5 if phase in phase_offset else 1.0
+                        bar_pct = min(1.0, base + span * pct)
+                        prog.progress(bar_pct, text=f"{phase} — {current}/{total} frames")
+                        eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s" if eta_sec > 0 else "—"
+                        status.caption(f"Estimated remaining: {eta_str}")
+                try:
+                    run_watermark(
+                        method=method,
+                        input_path=input_path,
+                        output_path=output_path,
+                        positions_path=positions_path,
+                        text=text,
+                        alpha=alpha,
+                        w_deeplab=w_deeplab,
+                        prefer_edges=prefer_edges,
+                        edge_margin=edge_margin,
+                        embed_dct_payload=embed_dct_payload,
+                        use_visible=use_visible,
+                        use_neural=use_neural,
+                        neural_payload_bits=neural_payload_bits,
+                        neural_color_mode=neural_color_mode,
+                        neural_delta_scale=neural_delta_scale,
+                        neural_delta_smooth_sigma=neural_delta_smooth_sigma,
+                        saliency_type=saliency_type,
+                        use_optical_flow=use_optical_flow,
+                        use_raft_flow=use_raft_flow,
+                        progress_callback=on_progress,
+                    )
+                    prog.progress(1.0, text="Done")
+                    prog.empty()
+                    st.session_state[OUTPUT_PATH] = str(output_path)
+                    st.session_state[POSITIONS_PATH] = str(positions_path)
+                    st.session_state[VIDEO_READY] = True
+                    st.success("Done! Check the Preview tab.")
+                except Exception as e:
+                    st.error(str(e))
 
     with tab2:
         if not input_path:
@@ -414,9 +527,9 @@ Edge margin: {edge_margin}
                     if orig_frame is not None and wm_frame is not None:
                         c1, c2 = st.columns(2)
                         with c1:
-                            st.image(cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB), caption="Original", use_container_width=True)
+                            st.image(cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB), caption="Original", width='stretch')
                         with c2:
-                            st.image(cv2.cvtColor(wm_frame, cv2.COLOR_BGR2RGB), caption="Watermarked", use_container_width=True)
+                            st.image(cv2.cvtColor(wm_frame, cv2.COLOR_BGR2RGB), caption="Watermarked", width='stretch')
 
     with tab3:
         if not input_path:
@@ -453,7 +566,7 @@ Edge margin: {edge_margin}
 
                 with col1:
                     st.caption("Saliency / complexity map (blue = less intrusive)")
-                    st.image(cv2.cvtColor(heatmap_overlay, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    st.image(cv2.cvtColor(heatmap_overlay, cv2.COLOR_BGR2RGB), width='stretch')
 
                 with col2:
                     # Preset position buttons
@@ -478,7 +591,7 @@ Edge margin: {edge_margin}
                     preview = frame.copy()
                     cv2.rectangle(preview, (new_x, new_y), (new_x + box_w, new_y + box_h), (0, 255, 0), 2)
                     st.caption("Preview with watermark box")
-                    st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), width='stretch')
 
                     keyframes: list = st.session_state.get(KEYFRAMES, [])
                     if st.button("Add keyframe at current frame"):
@@ -584,46 +697,147 @@ Edge margin: {edge_margin}
                 st.error("Upload both a watermarked video and a positions.json file.")
             else:
                 try:
-                    text = positions[0].get("text", "VideoWaterMarker")
-                    box_w = int(positions[0]["box_w"])
-                    box_h = int(positions[0]["box_h"])
-                    font_scale = float(positions[0].get("font_scale", 1.0))
-                    thickness = int(positions[0].get("thickness", 2))
-                    template_g = build_text_template(text, box_w, box_h, font_scale, thickness)
+                    has_visible_meta = "box_w" in (positions[0] or {})
+                    expected_neural = positions[0].get("neural_payload_bits") if positions else None
+                    model_dir = ROOT / "data" / "models" / "neural_wm"
+                    has_neural_models = (model_dir / "decoder.pt").exists()
 
-                    with st.spinner("Running detection..."):
-                        result = detect_video(
-                            video_path,
-                            positions,
-                            template_g,
-                            frame_step=5,
-                            search_pad=60,
-                            thr=thr,
-                            enable_global_fallback=True,
-                            global_downscale=0.5,
-                        )
+                    if not has_visible_meta and expected_neural and has_neural_models:
+                        # Neural-only: extract from video (majority vote across frames for robustness)
+                        with st.spinner("Running neural extraction..."):
+                            from src.neural_watermark.embed import NeuralWatermarker
+                            import torch
+                            wm = NeuralWatermarker(
+                                decoder_path=model_dir / "decoder.pt",
+                                encoder_path=model_dir / "encoder.pt",
+                                device="cuda" if torch.cuda.is_available() else "cpu",
+                            )
+                            cap = cv2.VideoCapture(str(video_path))
+                            votes: list[list[int]] = []  # per-frame extractions
+                            n = 0
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+                                if n % 5 == 0:  # sample every 5th frame
+                                    ext = wm.extract(frame)
+                                    bits = [int(b) for b in ext[: len(expected_neural)]]
+                                    votes.append(bits)
+                                n += 1
+                            cap.release()
+                            # Majority vote per bit across frames
+                            extracted_bits = None
+                            if votes:
+                                nb = len(expected_neural)
+                                extracted_bits = np.array([
+                                    1 if sum(v[i] for v in votes if len(v) > i) > len(votes) / 2 else 0
+                                    for i in range(nb)
+                                ])
+                            expected = expected_neural[: len(extracted_bits) if extracted_bits is not None else 0]
+                            if extracted_bits is not None and expected:
+                                matches = sum(1 for a, b in zip(expected, extracted_bits) if a == int(b))
+                                ber = 1.0 - (matches / len(expected)) if expected else 0
 
-                    st.metric("Detection rate", f"{result['rate']:.1f}%")
-                    st.metric("Embedded fingerprint", text)
-                    if result.get("dct_payload"):
-                        try:
-                            from src.crypto_payload import decode_payload
-                            decoded = decode_payload(result["dct_payload"], use_aes=False, use_ecc=True)
-                            if decoded:
-                                st.metric("DCT payload (decoded)", decoded)
-                        except Exception:
-                            st.caption("DCT payload extracted (decode failed)")
-                    st.caption("The fingerprint text identifies which user/session the video originated from.")
-                    with st.expander("Details"):
-                        det = {
-                            "frames_sampled": result["total"],
-                            "frames_detected": result["hit"],
-                            "mean_ncc": round(result["mean"], 4),
-                            "threshold": thr,
-                        }
+                                # Bits → fingerprint ID (8 bits = 1 byte, 0–255)
+                                def bits_to_id(bits):
+                                    n = 0
+                                    for i, b in enumerate(bits[:8]):
+                                        n |= (int(b) & 1) << i
+                                    return n
+
+                                exp_id = bits_to_id(expected)
+                                ext_id = bits_to_id(extracted_bits)
+
+                                st.metric("Neural payload (extracted)", f"{matches}/{len(expected)} bits correct")
+                                st.metric("Bit error rate", f"{ber*100:.1f}%")
+                                st.caption(
+                                    f"**Embedded fingerprint ID:** `0x{exp_id:02X}` ({exp_id}) · "
+                                    f"**Extracted ID:** `0x{ext_id:02X}` ({ext_id})"
+                                )
+                                with st.expander("Bit-level comparison"):
+                                    exp_str = "".join(str(int(b)) for b in expected)
+                                    ext_str = "".join(str(int(b)) for b in extracted_bits)
+                                    st.code(f"Expected:  {exp_str}\nExtracted: {ext_str}", language="text")
+
+                                with st.expander("🔍 Registry lookup (fuzzy)"):
+                                    st.caption(
+                                        "With bit errors, the extracted ID may not match exactly. "
+                                        "Use **fuzzy lookup** to find users whose fingerprint is within a few bit flips."
+                                    )
+                                    demo_reg = {str(exp_id): "user_001"}
+                                    for i in range(1, 4):
+                                        demo_reg[str((exp_id + i * 17) % 256)] = f"user_00{i+1}"
+                                    reg_input = st.text_area(
+                                        "Registry (fingerprint → user_id)",
+                                        value=json.dumps(demo_reg, indent=2),
+                                        help="JSON: decimal fingerprint (0-255) as key, user ID as value.",
+                                        key="reg_lookup",
+                                    )
+                                    max_dist = st.slider("Max Hamming distance", 0, 4, 2,
+                                        help="Allow up to N bit errors when matching. 2 = tolerate 2 wrong bits.")
+                                    if st.button("Find user", key="reg_btn"):
+                                        try:
+                                            reg = json.loads(reg_input) if isinstance(reg_input, str) else reg_input
+                                            candidates = _lookup_fingerprint(ext_id, reg, max_distance=max_dist)
+                                            if candidates:
+                                                st.success("Matches (closest first):")
+                                                for uid, dist in candidates:
+                                                    st.write(f"• **{uid}** ({dist} bit{'s' if dist != 1 else ''} off)")
+                                            else:
+                                                st.info("No user within that Hamming distance.")
+                                        except Exception as ex:
+                                            st.error(f"Invalid registry: {ex}")
+                            else:
+                                st.warning("Could not extract neural payload.")
+                    elif has_visible_meta:
+                        text = positions[0].get("text", "VideoWaterMarker")
+                        box_w = int(positions[0]["box_w"])
+                        box_h = int(positions[0]["box_h"])
+                        font_scale = float(positions[0].get("font_scale", 1.0))
+                        thickness = int(positions[0].get("thickness", 2))
+                        template_g = build_text_template(text, box_w, box_h, font_scale, thickness)
+
+                        with st.spinner("Running detection..."):
+                            result = detect_video(
+                                video_path,
+                                positions,
+                                template_g,
+                                frame_step=5,
+                                search_pad=60,
+                                thr=thr,
+                                enable_global_fallback=True,
+                                global_downscale=0.5,
+                            )
+
+                        st.metric("Detection rate", f"{result['rate']:.1f}%")
+                        st.metric("Embedded fingerprint", text)
                         if result.get("dct_payload"):
-                            det["dct_extracted"] = True
-                        st.json(det)
+                            try:
+                                from src.crypto_payload import decode_payload
+                                decoded = decode_payload(result["dct_payload"], use_aes=False, use_ecc=True)
+                                if decoded:
+                                    st.metric("DCT payload (decoded)", decoded)
+                            except Exception:
+                                st.caption("DCT payload extracted (decode failed)")
+                        st.caption("The fingerprint text identifies which user/session the video originated from.")
+                        with st.expander("Details"):
+                            det = {
+                                "frames_sampled": result["total"],
+                                "frames_detected": result["hit"],
+                                "mean_ncc": round(result["mean"], 4),
+                                "threshold": thr,
+                            }
+                            if result.get("dct_payload"):
+                                det["dct_extracted"] = True
+                            st.json(det)
+                    else:
+                        if not has_visible_meta and (not expected_neural or not has_neural_models):
+                            st.warning(
+                                "positions.json has no visible watermark metadata (box_w) and no neural payload. "
+                                "Use a video watermarked with visible, DCT, or neural."
+                            )
+                        else:
+                            st.error("Unable to detect: missing metadata.")
                 except Exception as e:
                     st.error(str(e))
 
@@ -669,29 +883,165 @@ Edge margin: {edge_margin}
             if not at_video_path or not at_positions or not at_attacks:
                 st.error("Provide video, positions, and select at least one attack.")
             else:
-                at_out = APP_OUTPUT / "attacks_ui"
-                at_out.mkdir(parents=True, exist_ok=True)
-                with st.spinner("Running attacks..."):
-                    results = run_attacks_ui(at_video_path, at_out, at_attacks)
-                if not results:
-                    st.error("Attack run failed (ffmpeg required).")
-                else:
-                    text = at_positions[0].get("text", "VideoWaterMarker")
-                    box_w = int(at_positions[0]["box_w"])
-                    box_h = int(at_positions[0]["box_h"])
-                    font_scale = float(at_positions[0].get("font_scale", 1.0))
-                    thickness = int(at_positions[0].get("thickness", 2))
-                    template_g = build_text_template(text, box_w, box_h, font_scale, thickness)
+                # visible_watermark=False means no visible text was drawn (DCT/Neural only)
+                has_visible_meta = "box_w" in (at_positions[0] or {})
+                has_visible_watermark = at_positions[0].get("visible_watermark", True)
+                expected_neural = at_positions[0].get("neural_payload_bits") if at_positions else None
+                model_dir = ROOT / "data" / "models" / "neural_wm"
+                has_neural_models = (model_dir / "decoder.pt").exists()
 
-                    st.subheader("Results")
-                    rows = []
-                    for name, out_path in results:
-                        r = detect_video(out_path, at_positions, template_g, frame_step=5, search_pad=60,
-                                        thr=at_thr, enable_global_fallback=True, global_downscale=0.5)
-                        rows.append({"Attack": name, "Detection %": round(r["rate"], 1), "Mean NCC": round(r["mean"], 4)})
-                    st.dataframe(rows, use_container_width=True)
-                    avg = sum(row["Detection %"] for row in rows) / len(rows) if rows else 0
-                    st.metric("Average detection across attacks", f"{avg:.1f}%")
+                # Neural path: no visible text (neural-only or DCT+Neural)
+                use_neural_path = (not has_visible_watermark or not has_visible_meta) and expected_neural and has_neural_models
+
+                if use_neural_path:
+                    # DCT+Neural or neural-only: run attacks, then extract neural from each
+                    at_out = APP_OUTPUT / "attacks_ui"
+                    at_out.mkdir(parents=True, exist_ok=True)
+
+                    prog = st.progress(0, text="Running attacks (ffmpeg)...")
+                    results = run_attacks_ui(at_video_path, at_out, at_attacks)
+                    prog.progress(0.3, text="Attacks done. Extracting neural watermark...")
+
+                    if not results:
+                        prog.empty()
+                        st.error("Attack run failed (ffmpeg required).")
+                    else:
+                        from src.neural_watermark.embed import NeuralWatermarker
+                        import torch
+                        wm = NeuralWatermarker(
+                            decoder_path=model_dir / "decoder.pt",
+                            encoder_path=model_dir / "encoder.pt",
+                            device="cuda" if torch.cuda.is_available() else "cpu",
+                        )
+
+                        def extract_neural_ber(video_path, expected_bits, sample_step=2):
+                            """Confidence-weighted voting: weight each frame by decoder certainty."""
+                            cap = cv2.VideoCapture(str(video_path))
+                            probs_list = []
+                            n = 0
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+                                if n % sample_step == 0:
+                                    p = wm.extract_probs(frame)[: len(expected_bits)]
+                                    probs_list.append(p)
+                                n += 1
+                            cap.release()
+                            if not probs_list or not expected_bits:
+                                return None, None
+                            nb = len(expected_bits)
+                            # Confidence weight: |p-0.5| so confident predictions count more
+                            weights = [np.abs(p - 0.5) + 0.01 for p in probs_list]
+                            extracted = np.array([
+                                1 if sum(p[i] * w[i] for p, w in zip(probs_list, weights)) / (sum(w[i] for w in weights) + 1e-9) > 0.5 else 0
+                                for i in range(nb)
+                            ])
+                            matches = sum(1 for a, b in zip(expected_bits, extracted) if a == int(b))
+                            ber = 1.0 - (matches / len(expected_bits))
+                            return matches, ber
+
+                        st.subheader("Neural watermark robustness")
+                        rows = []
+                        n_res = len(results)
+                        for i, (name, out_path) in enumerate(results):
+                            prog.progress(0.3 + 0.6 * (i + 1) / n_res, text=f"Extracting from {name}...")
+                            matches, ber = extract_neural_ber(out_path, expected_neural)
+                            if matches is not None:
+                                rows.append({"Attack": name, "Bits correct": f"{matches}/{len(expected_neural)}", "BER %": round(ber * 100, 1)})
+                            else:
+                                rows.append({"Attack": name, "Bits correct": "—", "BER %": "—"})
+                        prog.progress(1.0, text="Done.")
+                        prog.empty()
+                        st.dataframe(rows, width='stretch')
+                        valid = [r["BER %"] for r in rows if isinstance(r["BER %"], (int, float))]
+                        avg_ber = sum(valid) / len(valid) if valid else 0
+                        st.metric("Average BER across attacks", f"{avg_ber:.1f}%")
+                elif not has_visible_meta:
+                    st.info(
+                        "Attack test (visible detection) needs positions from a video with **visible** watermark. "
+                        "Neural-only videos require trained decoder in `data/models/neural_wm/` to run attack tests."
+                    )
+                else:
+                    # Visible watermark path (NCC detection)
+                    at_out = APP_OUTPUT / "attacks_ui"
+                    at_out.mkdir(parents=True, exist_ok=True)
+
+                    prog = st.progress(0, text="Running attacks (ffmpeg)...")
+                    results = run_attacks_ui(at_video_path, at_out, at_attacks)
+                    if not results:
+                        prog.empty()
+                        st.error("Attack run failed (ffmpeg required).")
+                    else:
+                        prog.progress(0.2, text="Attacks done. Running visible detection...")
+                        text = at_positions[0].get("text", "VideoWaterMarker")
+                        box_w = int(at_positions[0]["box_w"])
+                        box_h = int(at_positions[0]["box_h"])
+                        font_scale = float(at_positions[0].get("font_scale", 1.0))
+                        thickness = int(at_positions[0].get("thickness", 2))
+                        template_g = build_text_template(text, box_w, box_h, font_scale, thickness)
+
+                        st.subheader("All watermarks robustness")
+                        expected_neural = at_positions[0].get("neural_payload_bits")
+                        model_dir = ROOT / "data" / "models" / "neural_wm"
+                        has_neural = expected_neural and (model_dir / "decoder.pt").exists()
+
+                        def _extract_neural(video_path, exp_bits, step=2):
+                            if not exp_bits or not has_neural:
+                                return None, None
+                            from src.neural_watermark.embed import NeuralWatermarker
+                            import torch
+                            wm = NeuralWatermarker(decoder_path=model_dir / "decoder.pt",
+                                encoder_path=model_dir / "encoder.pt",
+                                device="cuda" if torch.cuda.is_available() else "cpu")
+                            cap = cv2.VideoCapture(str(video_path))
+                            probs_list = []
+                            n = 0
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+                                if n % step == 0:
+                                    p = wm.extract_probs(frame)[: len(exp_bits)]
+                                    probs_list.append(p)
+                                n += 1
+                            cap.release()
+                            if not probs_list:
+                                return None, None
+                            nb = len(exp_bits)
+                            weights = [np.abs(p - 0.5) + 0.01 for p in probs_list]
+                            ex = np.array([
+                                1 if sum(p[i] * w[i] for p, w in zip(probs_list, weights)) / (sum(w[i] for w in weights) + 1e-9) > 0.5 else 0
+                                for i in range(nb)
+                            ])
+                            m = sum(1 for a, b in zip(exp_bits, ex) if a == int(b))
+                            return m, 1.0 - (m / len(exp_bits))
+
+                        rows = []
+                        n_res = len(results)
+                        for i, (name, out_path) in enumerate(results):
+                            prog.progress(0.2 + 0.8 * (i + 1) / n_res, text=f"Detecting all in {name}...")
+                            r = detect_video(out_path, at_positions, template_g, frame_step=5, search_pad=60,
+                                            thr=at_thr, enable_global_fallback=True, global_downscale=0.5)
+                            row = {"Attack": name, "Visible %": round(r["rate"], 1), "NCC": round(r["mean"], 4)}
+                            row["DCT"] = "✓" if r.get("dct_payload") and len(r.get("dct_payload") or b"") > 0 else "—"
+                            if has_neural:
+                                nm, ber = _extract_neural(out_path, expected_neural)
+                                row["Neural"] = f"{nm}/{len(expected_neural)}" if nm is not None else "—"
+                                row["Neural BER%"] = round(ber * 100, 1) if ber is not None else "—"
+                            else:
+                                row["Neural"] = "—"
+                                row["Neural BER%"] = "—"
+                            rows.append(row)
+                        prog.progress(1.0, text="Done.")
+                        prog.empty()
+                        st.dataframe(rows, width='stretch')
+                        avg_vis = sum(row["Visible %"] for row in rows) / len(rows) if rows else 0
+                        st.metric("Average visible detection", f"{avg_vis:.1f}%")
+                        if has_neural:
+                            valid_ber = [r["Neural BER%"] for r in rows if isinstance(r.get("Neural BER%"), (int, float))]
+                            if valid_ber:
+                                st.metric("Average neural BER", f"{sum(valid_ber)/len(valid_ber):.1f}%")
 
     with tab6:
         st.markdown("""
@@ -726,6 +1076,8 @@ Edge margin: {edge_margin}
 
         ### Detect & Trace
         Use the **Detect (no generate)** tab to upload a watermarked video and trace back the embedded fingerprint.
+        For neural watermarks, use **Registry lookup (fuzzy)** to find users when extraction has bit errors:
+        the system matches by Hamming distance (e.g. 2 bit flips allowed → finds closest fingerprint in registry).
 
         ### Attack Test
         Use the **Attack test** tab to apply distortions (blur, crop, etc.) and measure detection robustness.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -288,7 +290,8 @@ def add_text_watermark_to_video(
     embed_dct_payload: Optional[bytes] = None,
     dct_strength: float = 3.0,
     dct_roi_size: int = 64,
-
+    draw_visible_text: bool = True,
+    progress_callback: Optional[Callable[[int, int, str, float], None]] = None,
 ) -> None:
     """
     Add a semi-transparent text watermark per frame.
@@ -352,25 +355,36 @@ def add_text_watermark_to_video(
     prev_frame = None
     prev_guide_map = None
     positions = []
+    t_start = time.perf_counter()
+    saliency_future = None
+    use_saliency_thread = use_hybrid or use_saliency_model
+    executor = ThreadPoolExecutor(max_workers=1) if use_saliency_thread else None
+
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        out.release()
+        return
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        
         lap_map = compute_complexity_map(frame)
 
         if use_hybrid:
             if saliency_model_instance is None:
                 saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
-            dl_map = saliency_model_instance.get_saliency_map(frame)
+            if saliency_future is not None:
+                dl_map = saliency_future.result()
+            else:
+                dl_map = saliency_model_instance.get_saliency_map(frame)
             guide_map = combine_maps(lap_map, dl_map, w_deeplab=w_deeplab)
 
         elif use_saliency_model:
             if saliency_model_instance is None:
                 saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
-            guide_map = saliency_model_instance.get_saliency_map(frame)
+            if saliency_future is not None:
+                guide_map = saliency_future.result()
+            else:
+                guide_map = saliency_model_instance.get_saliency_map(frame)
 
         else:
             guide_map = lap_map
@@ -446,6 +460,7 @@ def add_text_watermark_to_video(
                 "y": int(y),
                 "box_w": int(box_w),
                 "box_h": int(box_h),
+                "visible_watermark": draw_visible_text,
                 "text": text,
                 "mode": mode,
                 "w_deeplab": float(w_deeplab),
@@ -463,30 +478,45 @@ def add_text_watermark_to_video(
                     pos_entry["original_dct_payload_hex"] = embed_dct_payload.hex()
             positions.append(pos_entry)
 
-        overlay = frame.copy()
-        text_x = x + 10
-        text_y = y + box_h - 10
+        if draw_visible_text:
+            overlay = frame.copy()
+            text_x = x + 10
+            text_y = y + box_h - 10
 
-        cv2.putText(
-            overlay,
-            text,
-            (text_x, text_y),
-            font,
-            font_scale,
-            (255, 255, 255),
-            thickness,
-            cv2.LINE_AA,
-        )
+            cv2.putText(
+                overlay,
+                text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
 
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         out.write(frame)
         prev_frame = frame.copy()
         prev_guide_map = guide_map.copy()
 
         frame_idx += 1
+        elapsed = time.perf_counter() - t_start
+        eta_sec = (elapsed / frame_idx) * (frame_count - frame_idx) if frame_idx > 0 else 0
+        if progress_callback and frame_idx % 2 == 0:
+            progress_callback(frame_idx, frame_count, "visible+dct", eta_sec)
         if frame_idx % 10 == 0:
             print(f"[{mode}] Processed {frame_idx}/{frame_count} frames...")
 
+        # Prefetch saliency for next frame
+        ret_next, next_frame = cap.read()
+        if not ret_next:
+            break
+        if executor and use_saliency_thread and saliency_model_instance is not None:
+            saliency_future = executor.submit(saliency_model_instance.get_saliency_map, next_frame.copy())
+        frame = next_frame
+
+    if executor:
+        executor.shutdown(wait=True)
     cap.release()
     out.release()
     print(f"[{mode}] Saved watermarked video to: {output_path}")
