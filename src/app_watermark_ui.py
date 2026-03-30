@@ -47,6 +47,7 @@ FRAME_COUNT = "frame_count"
 VIDEO_READY = "video_ready"
 SALIENCY_MODEL = "saliency_model"
 KEYFRAMES = "keyframes"
+SKIP_RANGES = "skip_ranges"
 
 APP_DIR = ROOT / "data" / "app"
 APP_INPUT = APP_DIR / "input"
@@ -97,6 +98,8 @@ def init_session():
         st.session_state[SALIENCY_MODEL] = None
     if KEYFRAMES not in st.session_state:
         st.session_state[KEYFRAMES] = []
+    if SKIP_RANGES not in st.session_state:
+        st.session_state[SKIP_RANGES] = []
 
 
 @st.cache_resource
@@ -594,17 +597,57 @@ Edge margin: {edge_margin}
                     st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), width='stretch')
 
                     keyframes: list = st.session_state.get(KEYFRAMES, [])
+                    skip_ranges: list = st.session_state.get(SKIP_RANGES, [])
                     if st.button("Add keyframe at current frame"):
+                        keyframes = [k for k in keyframes if k[0] != frame_idx]
                         keyframes.append((frame_idx, new_x, new_y))
                         keyframes.sort(key=lambda k: k[0])
                         st.session_state[KEYFRAMES] = keyframes
                         st.success(f"Keyframe at frame {frame_idx}")
+
+                    st.markdown("#### No Visible Watermark Range")
+                    remove_here = st.checkbox(
+                        "Hide visible watermark around this frame",
+                        value=False,
+                        key="manual_hide_visible",
+                        help="Useful for close-up face scenes or shots where you want no visible text.",
+                    )
+                    past_skip = st.slider(
+                        "Frames before current frame",
+                        0, min(300, frame_count - 1 if frame_count else 0), 0,
+                        key="manual_skip_past",
+                    )
+                    next_skip = st.slider(
+                        "Frames after current frame",
+                        0, min(300, frame_count - 1 if frame_count else 0), 0,
+                        key="manual_skip_next",
+                    )
+                    covered_now = any(start <= frame_idx <= end for start, end in skip_ranges)
+                    if covered_now:
+                        st.caption("This frame is currently inside a no-watermark range.")
+                    if st.button("Add no-watermark range", disabled=not remove_here):
+                        start = max(0, frame_idx - past_skip)
+                        end = min(max(0, frame_count - 1), frame_idx + next_skip)
+                        skip_ranges.append((start, end))
+                        skip_ranges.sort(key=lambda r: (r[0], r[1]))
+                        st.session_state[SKIP_RANGES] = skip_ranges
+                        st.success(f"Visible watermark removed for frames {start} to {end}.")
+
                     if keyframes:
                         st.caption(f"Keyframes: {len(keyframes)} — {', '.join(f'f{k[0]}' for k in keyframes)}")
                         if st.button("Clear keyframes"):
                             st.session_state[KEYFRAMES] = []
+                    if skip_ranges:
+                        st.caption(
+                            "No-watermark ranges: "
+                            + ", ".join(f"f{start}-f{end}" for start, end in skip_ranges[:8])
+                            + (" ..." if len(skip_ranges) > 8 else "")
+                        )
+                        if st.button("Clear no-watermark ranges"):
+                            st.session_state[SKIP_RANGES] = []
 
                 use_keyframes = len(keyframes) >= 1
+                skip_ranges = st.session_state.get(SKIP_RANGES, [])
                 btn_label = "Re-export (interpolate keyframes)" if use_keyframes else "Re-export with new position"
                 if st.button(btn_label):
                     with st.spinner("Re-exporting..."):
@@ -619,6 +662,7 @@ Edge margin: {edge_margin}
                                     text=text,
                                     alpha=alpha,
                                     positions_path=pos_manual,
+                                    skip_ranges=skip_ranges,
                                 )
                             else:
                                 add_text_watermark_fixed_at(
@@ -629,6 +673,7 @@ Edge margin: {edge_margin}
                                     text=text,
                                     alpha=alpha,
                                     positions_path=pos_manual,
+                                    skip_ranges=skip_ranges,
                                 )
                             st.session_state[OUTPUT_PATH] = str(out_manual)
                             st.success(f"Saved to {out_manual.name}. Check Preview tab.")

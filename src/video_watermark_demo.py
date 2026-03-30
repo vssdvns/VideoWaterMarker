@@ -126,6 +126,13 @@ def compute_complexity_map(frame: np.ndarray) -> np.ndarray:
     return comp.astype("float32")
 
 
+def _frame_in_skip_ranges(frame_idx: int, skip_ranges: list[tuple[int, int]] | None) -> bool:
+    """True if frame_idx falls inside any [start, end] skip range."""
+    if not skip_ranges:
+        return False
+    return any(start <= frame_idx <= end for start, end in skip_ranges)
+
+
 def _in_edge_zone(x: int, y: int, box_w: int, box_h: int, w: int, h: int, edge_margin: float) -> bool:
     """True if window (x,y) is in the edge band (outer margin from each side)."""
     pad_w = max(box_w, int(w * edge_margin))
@@ -251,6 +258,7 @@ def add_text_watermark_fixed(
                 "frame": frame_idx, "t_ms": t_ms, "x": x, "y": y,
                 "box_w": box_w, "box_h": box_h, "text": text,
                 "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
+                "skip_visible": False,
             })
         frame_idx += 1
         if frame_idx % 50 == 0:
@@ -470,6 +478,7 @@ def add_text_watermark_to_video(
                 "alpha": float(alpha),
                 "font_scale": float(font_scale),
                 "thickness": int(thickness),
+                "skip_visible": False,
             }
             if dct_roi is not None:
                 pos_entry["dct_roi"] = {"x": dct_roi[0], "y": dct_roi[1], "w": dct_roi[2], "h": dct_roi[3]}
@@ -578,24 +587,26 @@ def add_text_watermark_from_positions(
         box_h = int(p["box_h"])
         font_scale = float(p.get("font_scale", 1.0))
         thickness = int(p.get("thickness", 2))
+        skip_visible = bool(p.get("skip_visible", False) or not p.get("visible_watermark", True))
 
         x = max(0, min(x, width - box_w - 1))
         y = max(0, min(y, height - box_h - 1))
         text_x = x + 10
         text_y = y + box_h - 10
 
-        overlay = frame.copy()
-        cv2.putText(
-            overlay,
-            text,
-            (text_x, text_y),
-            font,
-            font_scale,
-            (255, 255, 255),
-            thickness,
-            cv2.LINE_AA,
-        )
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        if not skip_visible:
+            overlay = frame.copy()
+            cv2.putText(
+                overlay,
+                text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         out.write(frame)
         frame_idx += 1
 
@@ -611,6 +622,7 @@ def add_text_watermark_fixed_at(
     text: str = "VideoWaterMarker",
     alpha: float = 0.5,
     positions_path: Path | None = None,
+    skip_ranges: list[tuple[int, int]] | None = None,
 ) -> None:
     """
     Fixed watermark at user-specified (x, y) for all frames.
@@ -648,9 +660,11 @@ def add_text_watermark_fixed_at(
         ret, frame = cap.read()
         if not ret:
             break
-        overlay = frame.copy()
-        cv2.putText(overlay, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        skip_visible = _frame_in_skip_ranges(frame_idx, skip_ranges)
+        if not skip_visible:
+            overlay = frame.copy()
+            cv2.putText(overlay, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         out.write(frame)
         if positions_path is not None:
             t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
@@ -658,6 +672,7 @@ def add_text_watermark_fixed_at(
                 "frame": frame_idx, "t_ms": t_ms, "x": x, "y": y,
                 "box_w": box_w, "box_h": box_h, "text": text,
                 "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
+                "skip_visible": skip_visible,
             })
         frame_idx += 1
 
@@ -738,6 +753,7 @@ def interpolate_keyframes_to_positions(
     frame_count: int,
     base_pos: dict,
     fps: float = 30.0,
+    skip_ranges: list[tuple[int, int]] | None = None,
 ) -> list[dict]:
     """
     Interpolate (x, y) from keyframes to all frames.
@@ -772,6 +788,7 @@ def interpolate_keyframes_to_positions(
         p["t_ms"] = t_ms
         p["x"] = x
         p["y"] = y
+        p["skip_visible"] = _frame_in_skip_ranges(fidx, skip_ranges)
         positions.append(p)
     return positions
 
@@ -783,6 +800,7 @@ def add_text_watermark_from_keyframes(
     text: str = "VideoWaterMarker",
     alpha: float = 0.5,
     positions_path: Path | None = None,
+    skip_ranges: list[tuple[int, int]] | None = None,
 ) -> None:
     """
     Apply watermark using keyframe-interpolated positions.
@@ -809,7 +827,7 @@ def add_text_watermark_from_keyframes(
         "box_w": box_w, "box_h": box_h, "text": text,
         "font_scale": font_scale, "thickness": thickness, "alpha": alpha,
     }
-    positions = interpolate_keyframes_to_positions(keyframes, frame_count, base_pos, fps)
+    positions = interpolate_keyframes_to_positions(keyframes, frame_count, base_pos, fps, skip_ranges=skip_ranges)
 
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

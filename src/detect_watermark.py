@@ -138,9 +138,13 @@ def detect_video(
         h, w = frame.shape[:2]
         t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
         pos_idx = find_nearest_pos_idx(times, t_ms)
+        pos = positions[pos_idx]
+        if bool(pos.get("skip_visible", False) or not pos.get("visible_watermark", True)):
+            idx += 1
+            continue
 
-        x = int(positions[pos_idx]["x"])
-        y = int(positions[pos_idx]["y"])
+        x = int(pos["x"])
+        y = int(pos["y"])
 
         # ---- Stage A: local ROI ----
         x0 = clamp(x - search_pad, 0, w - 1)
@@ -174,7 +178,7 @@ def detect_video(
 
         # DCT payload extraction (invisible watermark)
         if extract_dct_watermark is not None and has_dct_roi and dct_payload is None:
-            roi_info = positions[pos_idx].get("dct_roi", {})
+            roi_info = pos.get("dct_roi", {})
             if roi_info:
                 rx = int(roi_info.get("x", 0))
                 ry = int(roi_info.get("y", 0))
