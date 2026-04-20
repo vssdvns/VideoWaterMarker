@@ -36,10 +36,12 @@ from src.video_watermark_demo import (
     add_text_watermark_fixed_at,
     add_text_watermark_from_positions,
     add_text_watermark_from_keyframes,
+    compute_complexity_map,
     get_frame_heatmap,
 )
 
-# Session state keys
+# These keys are the shared memory for the Streamlit workflow. They let the
+# app move data between tabs without recomputing everything each time.
 INPUT_PATH = "input_path"
 OUTPUT_PATH = "output_path"
 POSITIONS_PATH = "positions_path"
@@ -65,6 +67,8 @@ def _lookup_fingerprint(extracted_id: int, registry: dict, max_distance: int = 2
     Find registry entries whose fingerprint is within max_distance (Hamming) of extracted_id.
     Returns [(user_id, distance), ...] sorted by distance.
     """
+    # The neural extractor can be a few bits off after attacks, so this helper
+    # performs a fuzzy registry lookup instead of requiring an exact byte match.
     results = []
     for fid_str, user_id in registry.items():
         try:
@@ -79,11 +83,15 @@ def _lookup_fingerprint(extracted_id: int, registry: dict, max_distance: int = 2
 
 
 def ensure_dirs():
+    # Create the working folders used by the UI for uploaded inputs and
+    # generated outputs.
     APP_INPUT.mkdir(parents=True, exist_ok=True)
     APP_OUTPUT.mkdir(parents=True, exist_ok=True)
 
 
 def init_session():
+    # Streamlit reruns the script often, so we seed every session key here to
+    # keep the rest of the app logic simple and predictable.
     if INPUT_PATH not in st.session_state:
         st.session_state[INPUT_PATH] = None
     if OUTPUT_PATH not in st.session_state:
@@ -104,6 +112,7 @@ def init_session():
 
 @st.cache_resource
 def get_saliency_model():
+    # Cache the saliency model once so switching tabs does not keep reloading it.
     from src.models.saliency_deeplab import DeepLabSaliency
     return DeepLabSaliency()
 
@@ -111,6 +120,8 @@ def get_saliency_model():
 def convert_to_h264_for_preview(src: Path, dst: Path) -> bool:
     """Convert mp4v (OpenCV) to H.264 for browser playback. Returns True if successful."""
     try:
+        # OpenCV often writes mp4v files that browsers do not like, so this
+        # converts preview videos into a web-friendly format for Streamlit.
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(src),
@@ -137,6 +148,8 @@ def _apply_neural_on_video(
     progress_callback=None,
 ) -> bool:
     """Apply neural watermark on existing video. Returns True if successful."""
+    # This helper is the second-stage neural pass: it reads an already-created
+    # video, embeds the learned watermark frame by frame, and writes a new file.
     enc_p = model_dir / "encoder.pt"
     dec_p = model_dir / "decoder.pt"
     if not enc_p.exists() or not dec_p.exists():
@@ -145,6 +158,7 @@ def _apply_neural_on_video(
         import time
         from src.neural_watermark.embed import NeuralWatermarker
         import torch
+        # Load the trained encoder/decoder and pick GPU automatically when available.
         wm = NeuralWatermarker(encoder_path=enc_p, decoder_path=dec_p,
             device="cuda" if torch.cuda.is_available() else "cpu", delta_scale=delta_scale)
         cap = cv2.VideoCapture(str(src))
@@ -154,6 +168,8 @@ def _apply_neural_on_video(
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(str(dst), fourcc, fps, (w, h))
         n, t_start = 0, time.perf_counter()
+        # Process the video frame-by-frame so progress, ETA, and quality settings
+        # all stay under UI control.
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -162,6 +178,8 @@ def _apply_neural_on_video(
                              delta_smooth_sigma=delta_smooth_sigma)
             out.write(frame)
             n += 1
+            # Report progress periodically instead of on every frame to keep the
+            # Streamlit UI responsive.
             if progress_callback and n % 5 == 0 and frame_count > 0:
                 elapsed = time.perf_counter() - t_start
                 eta = (elapsed / n) * (frame_count - n) if n > 0 else 0
@@ -171,6 +189,21 @@ def _apply_neural_on_video(
         return n > 0
     except Exception:
         return False
+
+
+def _build_neural_meta(
+    payload_bits: list[int],
+    color_mode: str,
+    delta_scale: float,
+    delta_smooth_sigma: float,
+) -> dict:
+    """Metadata needed to recreate the same neural watermark settings later."""
+    return {
+        "neural_payload_bits": payload_bits,
+        "neural_color_mode": color_mode,
+        "neural_delta_scale": float(delta_scale),
+        "neural_delta_smooth_sigma": float(delta_smooth_sigma),
+    }
 
 
 def run_watermark(method: str, input_path: Path, output_path: Path, positions_path: Path,
@@ -189,16 +222,26 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
     ensure_dirs()
     model_dir = ROOT / "data" / "models" / "neural_wm"
 
-    # Neural-only path: no visible text, no DCT — apply neural directly to input
+    # Special case: if the user wants only a neural watermark, skip the visible
+    # and DCT pipeline entirely and watermark the original video directly.
     if not use_visible and not embed_dct_payload and use_neural and neural_payload_bits and model_dir.exists():
         if _apply_neural_on_video(input_path, output_path, neural_payload_bits, model_dir, neural_color_mode, neural_delta_scale, neural_delta_smooth_sigma, progress_callback):
             positions_path.parent.mkdir(parents=True, exist_ok=True)
             positions_path.write_text(
-                json.dumps([{"neural_payload_bits": neural_payload_bits}], indent=2),
+                json.dumps([
+                    _build_neural_meta(
+                        neural_payload_bits,
+                        neural_color_mode,
+                        neural_delta_scale,
+                        neural_delta_smooth_sigma,
+                    )
+                ], indent=2),
                 encoding="utf-8",
             )
         return
 
+    # Standard visible watermark path. Fixed placement uses a simpler helper,
+    # while the other modes use the full placement pipeline.
     if method == "Fixed" and not embed_dct_payload and not use_neural:
         add_text_watermark_fixed(
             input_path=input_path,
@@ -220,10 +263,14 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
             use_hybrid=use_hybrid,
             w_deeplab=w_deeplab,
             temporal_smoothing=True,
-            temporal_alpha=0.8,
-            max_jump=150,
+            temporal_alpha=0.85,
+            max_jump=60,
             use_optical_flow=use_optical_flow,
             use_raft_flow=use_raft_flow,
+            flow_reject_dist=60,
+            relocate_confirm_frames=3,
+            relocate_match_dist=28,
+            relocate_jump=80,
             save_positions=True,
             positions_path=positions_path,
             prefer_edges=prefer_edges,
@@ -234,24 +281,36 @@ def run_watermark(method: str, input_path: Path, output_path: Path, positions_pa
             progress_callback=progress_callback,
         )
 
-    # Apply neural on top if requested
+    # If the user enabled the neural branch as well, run it after the visible
+    # and/or DCT output is done so all watermark channels end up in one file.
     if use_neural and neural_payload_bits and model_dir.exists():
         tmp = output_path.parent / (output_path.stem + "_tmp.mp4")
         tmp.unlink(missing_ok=True)
         output_path.rename(tmp)
         if _apply_neural_on_video(tmp, output_path, neural_payload_bits, model_dir, neural_color_mode, neural_delta_scale, neural_delta_smooth_sigma, progress_callback):
             tmp.unlink(missing_ok=True)
-            # Save neural payload in positions for detection
+            # Persist the neural payload bits into positions.json so the detect
+            # and attack-test tabs know what they should recover later.
             if positions_path.exists():
                 data = json.loads(positions_path.read_text(encoding="utf-8"))
                 if data:
-                    data[0]["neural_payload_bits"] = neural_payload_bits
+                    data[0].update(
+                        _build_neural_meta(
+                            neural_payload_bits,
+                            neural_color_mode,
+                            neural_delta_scale,
+                            neural_delta_smooth_sigma,
+                        )
+                    )
                     positions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         else:
             tmp.rename(output_path)
 
 
 def main():
+    # The app is organized as a single Streamlit workflow: collect settings in
+    # the sidebar, then drive generation, preview, adjustment, detection, and
+    # attack testing from tabs.
     st.set_page_config(page_title="Video Watermarker", page_icon="🎬", layout="wide")
     init_session()
     ensure_dirs()
@@ -259,10 +318,12 @@ def main():
     st.title("🎬 Hybrid Video Watermarker")
     st.markdown("Upload a video, choose a watermarking method, and optionally adjust the placement manually.")
 
-    # --- Sidebar: Upload & settings ---
+    # Sidebar = everything needed to define one watermarking run.
     with st.sidebar:
         st.header("Settings")
         uploaded = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"])
+        # Save the uploaded clip into the app workspace and cache its frame count
+        # for later sliders, progress bars, and preview tools.
         if uploaded:
             input_path = APP_INPUT / "uploaded.mp4"
             with open(input_path, "wb") as f:
@@ -298,6 +359,8 @@ def main():
                 help="RAFT instead of Farneback. Requires more GPU memory.",
             )
 
+        # The user can combine channels, so the visible, DCT, and neural
+        # branches are configured independently here.
         st.subheader("Watermark types")
         use_visible = st.checkbox("Visible (text overlay)", value=True,
             help="Semi-transparent text on video. Always recommended for traceability.")
@@ -307,6 +370,8 @@ def main():
             help="Learning-based invisible watermark. Requires trained encoder/decoder in data/models/neural_wm/.")
         neural_color_mode = "luma_only"
         neural_delta_scale = 0.04
+        # Neural watermarking exposes extra quality-vs-robustness controls
+        # because that branch is the most sensitive to strength settings.
         if use_neural:
             neural_color_mode = st.selectbox(
                 "Neural color preservation",
@@ -332,6 +397,8 @@ def main():
         else:
             neural_delta_smooth_sigma = 1.0
 
+        # Traceability mode turns user/session context into visible text and,
+        # if enabled, also into hidden payloads.
         st.subheader("Traceability (Phase 2)")
         use_traceability = st.checkbox(
             "Use user-specific fingerprint",
@@ -367,7 +434,8 @@ def main():
             edge_margin = st.slider("Edge margin", 0.08, 0.25, 0.12, 0.01,
                 help="Fraction of frame width/height for edge zone (larger = stricter).")
 
-    # Build DCT payload (needs user_id or text for encoding)
+    # Build the DCT payload once from the current user/text settings so the
+    # generate step can simply pass it through.
     embed_dct_payload = None
     if use_dct and (user_id or text):
         try:
@@ -380,13 +448,14 @@ def main():
         except ImportError:
             pass
 
-    # Neural payload: 8 bits from hash of user_id or text
+    # The neural branch currently uses a compact 8-bit payload derived from the
+    # current identifier so it stays lightweight during testing.
     neural_payload_bits = None
     if use_neural:
         h = hash((user_id or text) or "default") & 0xFF
         neural_payload_bits = [(h >> i) & 1 for i in range(8)]
 
-    # --- Output filename ---
+    # Keep output naming configurable so the user can preserve multiple runs.
     output_basename = st.text_input(
         "Output filename (without .mp4)",
         value="watermarked",
@@ -397,7 +466,8 @@ def main():
     output_name = base + ".mp4"
     positions_name = "positions.json" if base == "watermarked" else base + "_positions.json"
 
-    # --- Main: Tabs ---
+    # Tabs split the workflow into generation, review, manual editing,
+    # detection, robustness testing, and traceability explanation.
     input_path_raw = st.session_state.get(INPUT_PATH)
     input_path = Path(input_path_raw) if input_path_raw and Path(input_path_raw).exists() else None
     output_path = APP_OUTPUT / output_name
@@ -412,6 +482,8 @@ def main():
             st.info("👆 Upload a video in the sidebar to start.")
         else:
             if st.button("🚀 Generate watermarked video"):
+                # Generation can take a while, so the callback updates both the
+                # progress bar and a rough ETA while watermarking runs.
                 prog = st.progress(0, text="Starting...")
                 status = st.caption("")
                 phase_offset = {"visible+dct": 0.0, "neural": 0.5}
@@ -425,6 +497,8 @@ def main():
                         eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s" if eta_sec > 0 else "—"
                         status.caption(f"Estimated remaining: {eta_str}")
                 try:
+                    # Run the selected watermark pipeline with whatever mix of
+                    # visible, DCT, and neural settings the user chose.
                     run_watermark(
                         method=method,
                         input_path=input_path,
@@ -462,7 +536,7 @@ def main():
         elif not output_path.exists():
             st.info("Generate a watermarked video first.")
         else:
-            # OpenCV writes mp4v which browsers often can't play. Convert to H.264 for preview.
+            # Convert previews to H.264 when needed so Streamlit can play them in-browser.
             preview_path = APP_OUTPUT / "watermarked_preview.mp4"
             manual_preview = APP_OUTPUT / "watermarked_manual_preview.mp4"
             active_output = st.session_state.get(OUTPUT_PATH) or str(output_path)
@@ -486,6 +560,8 @@ def main():
                     )
                 with open(src, "rb") as f:
                     st.download_button("Download watermarked video", f, file_name=src.name, mime="video/mp4")
+                # Pull lightweight metadata from the saved positions file so the
+                # preview tab can also summarize which watermark channels exist.
                 pos_data = {}
                 for pp in [positions_path, APP_OUTPUT / "positions_manual.json", APP_OUTPUT / "positions.json"]:
                     if pp.exists():
@@ -513,7 +589,59 @@ Edge margin: {edge_margin}
 """
                 st.download_button("📄 Export summary (txt)", data=summary, file_name="watermark_summary.txt", mime="text/plain", key="dl_summary")
 
-                # Original vs watermarked comparison
+                # Presentation/demo helper: regenerate a neural-only clip with the
+                # raw RGB perturbation so the user can show what the network adds
+                # before color-preserving cleanup is applied.
+                if has_neural and input_path:
+                    neural_meta = pos_data[0] if pos_data else {}
+                    raw_bits = neural_meta.get("neural_payload_bits")
+                    raw_scale = float(neural_meta.get("neural_delta_scale", 0.04))
+                    model_dir = ROOT / "data" / "models" / "neural_wm"
+                    raw_neural_src = APP_OUTPUT / f"{src.stem}_raw_neural_demo.mp4"
+                    raw_neural_preview = APP_OUTPUT / f"{src.stem}_raw_neural_demo_preview.mp4"
+                    st.markdown("---")
+                    st.subheader("Raw Neural Demo")
+                    st.caption(
+                        "Shows the neural watermark alone using raw RGB perturbation, without color-preserving mode or delta smoothing. "
+                        "Useful for presentations to illustrate what the network is actually adding."
+                    )
+                    if st.button("Generate raw neural demo", key="gen_raw_neural_demo"):
+                        with st.spinner("Generating raw neural demo..."):
+                            ok = _apply_neural_on_video(
+                                input_path,
+                                raw_neural_src,
+                                raw_bits,
+                                model_dir,
+                                color_mode="rgb",
+                                delta_scale=raw_scale,
+                                delta_smooth_sigma=0.0,
+                            ) if raw_bits and model_dir.exists() else False
+                        if ok:
+                            st.success("Raw neural demo ready below.")
+                        else:
+                            st.warning("Could not generate raw neural demo. Make sure neural models are available.")
+                    if raw_neural_src.exists():
+                        raw_needs_convert = (
+                            not raw_neural_preview.exists()
+                            or raw_neural_src.stat().st_mtime > raw_neural_preview.stat().st_mtime
+                        )
+                        if raw_needs_convert:
+                            convert_to_h264_for_preview(raw_neural_src, raw_neural_preview)
+                        if raw_neural_preview.exists():
+                            st.video(str(raw_neural_preview))
+                        else:
+                            st.video(str(raw_neural_src))
+                        with open(raw_neural_src, "rb") as f:
+                            st.download_button(
+                                "Download raw neural demo",
+                                f,
+                                file_name=raw_neural_src.name,
+                                mime="video/mp4",
+                                key="dl_raw_neural_demo",
+                            )
+
+                # Side-by-side frame comparison helps the user judge quality
+                # instead of relying only on the final video playback.
                 st.markdown("---")
                 st.subheader("Compare: Original vs Watermarked")
                 fc = st.session_state.get(FRAME_COUNT, 100)
@@ -552,6 +680,8 @@ Edge margin: {edge_margin}
             if heatmap_method == "fixed":
                 heatmap_method = "heuristic"
 
+            # Compute the saliency/complexity heatmap for the chosen frame so
+            # the user can understand why the automatic placement landed there.
             try:
                 frame, heatmap_overlay, x, y, box_w, box_h, _, _ = get_frame_heatmap(
                     input_path,
@@ -566,13 +696,19 @@ Edge margin: {edge_margin}
                 st.error(f"Could not compute heatmap: {e}")
             else:
                 col1, col2 = st.columns(2)
+                lap_map = compute_complexity_map(frame)
+                lap_uint8 = np.clip(lap_map * 255.0, 0, 255).astype(np.uint8)
+                lap_color = cv2.applyColorMap(lap_uint8, cv2.COLORMAP_INFERNO)
+                lap_overlay = cv2.addWeighted(frame, 0.55, lap_color, 0.45, 0.0)
+                _, lap_png = cv2.imencode(".png", lap_color)
 
                 with col1:
                     st.caption("Saliency / complexity map (blue = less intrusive)")
                     st.image(cv2.cvtColor(heatmap_overlay, cv2.COLOR_BGR2RGB), width='stretch')
 
                 with col2:
-                    # Preset position buttons
+                    # Offer quick presets plus fine-grained sliders so the user
+                    # can either snap to common corners or place the box manually.
                     w_f, h_f = frame.shape[1], frame.shape[0]
                     pad = 20
                     presets = [
@@ -596,6 +732,8 @@ Edge margin: {edge_margin}
                     st.caption("Preview with watermark box")
                     st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), width='stretch')
 
+                    # Keyframes control motion over time, while skip ranges let
+                    # the user intentionally suppress visible text for a span.
                     keyframes: list = st.session_state.get(KEYFRAMES, [])
                     skip_ranges: list = st.session_state.get(SKIP_RANGES, [])
                     if st.button("Add keyframe at current frame"):
@@ -646,6 +784,34 @@ Edge margin: {edge_margin}
                         if st.button("Clear no-watermark ranges"):
                             st.session_state[SKIP_RANGES] = []
 
+                st.markdown("---")
+                st.subheader("Laplacian Map for Presentation")
+                st.caption(
+                    "This frame-specific Laplacian map highlights texture and edge-heavy regions. "
+                    "Brighter areas are more complex, while darker areas are smoother and usually better for visible placement."
+                )
+                lap_col1, lap_col2, lap_col3 = st.columns(3)
+                with lap_col1:
+                    st.caption(f"Original frame {frame_idx}")
+                    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), width="stretch")
+                with lap_col2:
+                    st.caption("Raw Laplacian map")
+                    st.image(lap_uint8, clamp=True, width="stretch")
+                with lap_col3:
+                    st.caption("Colorized Laplacian map")
+                    st.image(cv2.cvtColor(lap_color, cv2.COLOR_BGR2RGB), width="stretch")
+                st.caption("Overlay view")
+                st.image(cv2.cvtColor(lap_overlay, cv2.COLOR_BGR2RGB), width="stretch")
+                st.download_button(
+                    "Download Laplacian map (PNG)",
+                    data=lap_png.tobytes(),
+                    file_name=f"laplacian_frame_{frame_idx:04d}.png",
+                    mime="image/png",
+                    key=f"dl_laplacian_map_{frame_idx}",
+                )
+
+                # Re-export either from one fixed position or from interpolated
+                # keyframes, depending on what the user configured above.
                 use_keyframes = len(keyframes) >= 1
                 skip_ranges = st.session_state.get(SKIP_RANGES, [])
                 btn_label = "Re-export (interpolate keyframes)" if use_keyframes else "Re-export with new position"
@@ -719,6 +885,8 @@ Edge margin: {edge_margin}
             help="Higher = stricter. 0.40 is a good balance.")
 
         if st.button("Detect watermark", key="detect_btn"):
+            # The detect tab supports both a visible-watermark path and a
+            # neural-only path, depending on what metadata is present.
             video_path = None
             positions = None
 
@@ -760,6 +928,8 @@ Edge margin: {edge_margin}
                             cap = cv2.VideoCapture(str(video_path))
                             votes: list[list[int]] = []  # per-frame extractions
                             n = 0
+                            # Sample frames across the clip and vote across them
+                            # so one noisy frame does not decide the whole payload.
                             while True:
                                 ret, frame = cap.read()
                                 if not ret:
@@ -783,7 +953,8 @@ Edge margin: {edge_margin}
                                 matches = sum(1 for a, b in zip(expected, extracted_bits) if a == int(b))
                                 ber = 1.0 - (matches / len(expected)) if expected else 0
 
-                                # Bits → fingerprint ID (8 bits = 1 byte, 0–255)
+                                # Convert the bit vectors into a compact id that
+                                # can be matched against a registry entry.
                                 def bits_to_id(bits):
                                     n = 0
                                     for i, b in enumerate(bits[:8]):
@@ -835,6 +1006,8 @@ Edge margin: {edge_margin}
                             else:
                                 st.warning("Could not extract neural payload.")
                     elif has_visible_meta:
+                        # Visible detection rebuilds the template from metadata
+                        # and then runs the NCC detector against the uploaded clip.
                         text = positions[0].get("text", "VideoWaterMarker")
                         box_w = int(positions[0]["box_w"])
                         box_h = int(positions[0]["box_h"])
@@ -907,6 +1080,8 @@ Edge margin: {edge_margin}
         at_thr = st.slider("Detection threshold", 0.25, 0.55, 0.40, 0.01, key="at_thr")
 
         if st.button("Run attacks & detect", key="at_run"):
+            # The attack tab first generates attacked files and then measures
+            # whichever watermark channels are available for this run.
             at_video_path = None
             at_positions = None
             if at_use_last and output_path.exists():
@@ -989,6 +1164,7 @@ Edge margin: {edge_margin}
                         st.subheader("Neural watermark robustness")
                         rows = []
                         n_res = len(results)
+                        # Evaluate every attacked clip and summarize BER by attack type.
                         for i, (name, out_path) in enumerate(results):
                             prog.progress(0.3 + 0.6 * (i + 1) / n_res, text=f"Extracting from {name}...")
                             matches, ber = extract_neural_ber(out_path, expected_neural)
@@ -1062,6 +1238,8 @@ Edge margin: {edge_margin}
                             m = sum(1 for a, b in zip(exp_bits, ex) if a == int(b))
                             return m, 1.0 - (m / len(exp_bits))
 
+                        # Collect one combined row per attack so the user can
+                        # compare visible, DCT, and neural robustness together.
                         rows = []
                         n_res = len(results)
                         for i, (name, out_path) in enumerate(results):
@@ -1089,6 +1267,8 @@ Edge margin: {edge_margin}
                                 st.metric("Average neural BER", f"{sum(valid_ber)/len(valid_ber):.1f}%")
 
     with tab6:
+        # This final tab is documentation inside the app: it explains how the
+        # project uses fingerprints and why multiple watermark channels exist.
         st.markdown("""
         ## User-Specific Fingerprint (Traceability)
 

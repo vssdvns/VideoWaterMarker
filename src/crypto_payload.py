@@ -16,7 +16,8 @@ import os
 import secrets
 from typing import Optional
 
-# Optional: AES-GCM encryption
+# AES-GCM is optional because some workflows only need traceability, while
+# others also want confidentiality for the embedded payload.
 try:
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import pad, unpad
@@ -24,7 +25,7 @@ try:
 except ImportError:
     HAS_CRYPTO = False
 
-# Reed-Solomon error correction
+# Reed-Solomon is optional too, but it helps the payload survive distortion.
 try:
     from reedsolo import RSCodec
     HAS_REEDSOLO = True
@@ -41,6 +42,8 @@ MAX_PAYLOAD_BYTES = 48  # session_id + metadata, before ECC
 
 def _derive_key(secret: bytes, salt: Optional[bytes] = None) -> tuple[bytes, bytes]:
     """Derive 32-byte key and 12-byte nonce from secret using HKDF-like approach."""
+    # If the caller provides only a shorter secret, stretch it into a fixed-size
+    # key so encryption uses a consistent format.
     if salt is None:
         salt = secrets.token_bytes(16)
     key_material = hashlib.pbkdf2_hmac("sha256", secret, salt, 100000, dklen=48)
@@ -72,6 +75,8 @@ def encode_payload(
     Returns:
         (payload_bytes, salt_or_none) — payload to embed; salt if AES used (needed for decrypt).
     """
+    # Build one compact pipe-delimited forensic record from the user/session
+    # fields that should travel inside the watermark.
     parts = [user_id]
     if session_id:
         parts.append(str(session_id))
@@ -82,11 +87,13 @@ def encode_payload(
 
     raw = "|".join(parts).encode("utf-8")
     if len(raw) > MAX_PAYLOAD_BYTES:
+        # Keep the payload bounded so it still fits inside the watermark carrier.
         raw = raw[:MAX_PAYLOAD_BYTES]
 
     salt = None
     if use_aes and HAS_CRYPTO and secret_key is not None:
-        # AES-GCM: 12-byte nonce (96 bits) is recommended
+        # Encrypt first when confidentiality is required, keeping nonce and tag
+        # inside the payload so the extractor has everything it needs.
         key = secret_key[:32] if len(secret_key) >= 32 else _derive_key(secret_key)[0]
         cipher = AES.new(key, AES.MODE_GCM)
         nonce = cipher.nonce
@@ -97,6 +104,8 @@ def encode_payload(
         salt = nonce  # callers may store nonce separately
 
     if use_ecc and HAS_REEDSOLO:
+        # Add redundancy after encryption so the final payload is more tolerant
+        # to compression and recovery errors.
         rs = RSCodec(RS_NSYM)
         raw = rs.encode(raw)
 
@@ -123,6 +132,7 @@ def decode_payload(
     Returns:
         Decoded string (e.g. "user_001|sess_xyz|US-CA|ios") or None on failure.
     """
+    # Reverse the encode order: ECC first, then decrypt, then decode to text.
     raw = bytes(payload)
     if use_ecc and HAS_REEDSOLO:
         try:
@@ -132,6 +142,8 @@ def decode_payload(
             return None
 
     if use_aes and HAS_CRYPTO and secret_key is not None:
+        # AES-GCM verification fails closed, which protects against both wrong
+        # keys and corrupted payload bytes.
         if len(raw) < 12 + 16:
             return None
         n = raw[:12]
@@ -156,12 +168,15 @@ def payload_to_embed_string(payload: bytes, max_chars: int = 24) -> str:
     Convert payload to short string for visible watermark display.
     Uses base64url, truncated. For full traceability, use decode_payload on extracted bytes.
     """
+    # Convert binary payload bytes into a short printable string that can still
+    # be shown in a visible watermark when needed.
     s = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
     return s[:max_chars] if len(s) > max_chars else s
 
 
 def embed_string_to_payload(s: str) -> Optional[bytes]:
     """Reverse of payload_to_embed_string (adds padding if needed)."""
+    # Restore stripped base64 padding before decoding.
     try:
         pad_len = 4 - (len(s) % 4)
         if pad_len != 4:

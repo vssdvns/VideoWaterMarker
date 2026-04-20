@@ -5,18 +5,25 @@ import argparse
 import subprocess
 
 
+# Shared ffmpeg flags used by every attack command so each run is quiet,
+# non-interactive, and safe to overwrite during repeated benchmarks.
 FFMPEG_BASE = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats"]
 
 
 def run(cmd: list[str]) -> None:
+    # Run one fully-built ffmpeg command and let failures raise immediately
+    # so the benchmark stops on broken attack settings instead of hiding errors.
     subprocess.run(cmd, check=True)
 
 
 def out(out_dir: Path, name: str) -> str:
+    # Keep output path building in one helper so the attack list stays readable.
     return str(out_dir / name)
 
 
 def main():
+    # Read the source clip and the destination folder where all attacked
+    # versions will be written.
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
@@ -26,6 +33,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Each tuple is one named attack plus the ffmpeg arguments that create it.
+    # The rest of the script simply loops over this list and executes them.
     attacks: list[tuple[str, list[str]]] = []
 
     # A) Re-encode
@@ -72,6 +81,8 @@ def main():
 
     print(f"[ATTACK] running {len(attacks)} attacks -> {out_dir}")
     for name, params in attacks:
+        # Build one ffmpeg command per attack and write the result to a
+        # predictable filename so detection scripts can consume them later.
         cmd = FFMPEG_BASE + ["-i", str(inp)] + params + [out(out_dir, name)]
         run(cmd)
 

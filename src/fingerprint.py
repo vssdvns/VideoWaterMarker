@@ -34,6 +34,8 @@ def encode_fingerprint(
     Returns:
         Watermark text string, e.g. "ID:alice", "ID:a1b2c3d4", or "ID:a1b2.LA.ios".
     """
+    # Normalize the raw inputs first so the same user/session information
+    # always turns into the same watermark text format.
     user_id = (user_id or "").strip()
     if not user_id:
         return "VideoWaterMarker"
@@ -41,12 +43,16 @@ def encode_fingerprint(
     location = (location or "").strip()
     device = (device or "").strip()
 
+    # Hash when privacy matters or when the payload would be too long to show
+    # directly inside a visible watermark.
     if use_hash or len(user_id) > 12 or location or device:
         payload = user_id
         if location:
             payload += "." + location
         if device:
             payload += "." + device
+        # The visible watermark only needs a short stable identifier, not the
+        # full original string.
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         short = digest[:8].lower()
 
@@ -57,11 +63,14 @@ def encode_fingerprint(
             parts.append(_sanitize(device, 6))
         return ".".join(parts)
 
+    # For short demo-friendly ids, keep the watermark human-readable.
     return f"{prefix}:{_sanitize(user_id, 16)}"
 
 
 def _sanitize(s: str, max_len: int) -> str:
     """Keep only alphanumeric and common chars, truncate."""
+    # Visible watermark text has to stay compact and render safely on video,
+    # so strip unusual characters and cap the length.
     s = re.sub(r"[^a-zA-Z0-9\-_]", "", s)
     return s[:max_len] if s else ""
 
@@ -78,6 +87,8 @@ def decode_lookup(fingerprint_text: str, registry: dict[str, str]) -> str | None
     Returns:
         user_id if found, else None.
     """
+    # Only the short hash code is used for lookup; location/device suffixes are
+    # display context and are ignored here.
     match = fingerprint_text.split(".")[0] if fingerprint_text else ""
     if ":" in match:
         short_code = match.split(":")[-1].lower()
@@ -97,6 +108,8 @@ def build_registry_entry(
     Returns:
         (watermark_text, short_code) - store short_code -> user_id in your DB.
     """
+    # Build both the watermark text and the short-code key that should be saved
+    # in a registry or database for later reverse lookup.
     text = encode_fingerprint(user_id, location, device, use_hash=True)
     short = text.split(":")[-1].split(".")[0]
     return text, short

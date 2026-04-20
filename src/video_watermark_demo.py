@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,6 +24,7 @@ try:
 except ImportError:
     embed_dct_watermark = None
 
+# Keep the RAFT model cached so repeated flow calls do not keep rebuilding it.
 _raft_model = None
 
 
@@ -34,6 +36,7 @@ def compute_flow_raft(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray 
         from torchvision import transforms as T
         from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
         if _raft_model is None:
+            # Load the pretrained RAFT model once and reuse it for later frames.
             w = Raft_Small_Weights.DEFAULT
             m = raft_small(weights=w).eval().to("cuda" if torch.cuda.is_available() else "cpu")
             _raft_model = (m, w.transforms())
@@ -46,7 +49,8 @@ def compute_flow_raft(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray 
     prev_rgb = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2RGB)
     curr_rgb = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2RGB)
     h, w = prev_bgr.shape[:2]
-    # RAFT: H,W div by 8; use transforms for [-1,1]
+    # RAFT expects dimensions divisible by 8, so resize into a valid working
+    # size first and scale the flow back afterward.
     nh, nw = (h // 8) * 8, (w // 8) * 8
     nh, nw = max(64, nh), max(64, nw)
     pt = torch.from_numpy(prev_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0
@@ -68,6 +72,8 @@ def compute_flow_raft(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray 
 
 def compute_flow_farneback(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray:
     """Dense optical flow from prev -> curr using Farneback. Returns flow (H,W,2)."""
+    # Farneback is the lightweight motion-estimation fallback used when RAFT
+    # is not requested or not available.
     prev_g = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
     curr_g = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -86,6 +92,8 @@ def warp_map_with_flow(map2d: np.ndarray, flow: np.ndarray) -> np.ndarray:
     map2d: (H,W) float32
     flow:  (H,W,2) float32 where flow[x,y] = (dx,dy)
     """
+    # This warps yesterday's guide map into today's frame so the watermark can
+    # follow scene motion instead of jittering independently frame-by-frame.
     h, w = map2d.shape[:2]
     grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
     # For remap: source coords in prev that map to current pixel.
@@ -108,6 +116,8 @@ def combine_maps(lap_map: np.ndarray, dl_map: np.ndarray, w_deeplab: float) -> n
     Both maps should be normalized in [0,1].
     Returns combined map in [0,1] (approximately).
     """
+    # Hybrid placement blends low-level texture complexity with semantic
+    # saliency so the watermark avoids both busy texture and important objects.
     w_deeplab = float(np.clip(w_deeplab, 0.0, 1.0))
     w_lap = 1.0 - w_deeplab
     combined = (w_lap * lap_map) + (w_deeplab * dl_map)
@@ -118,6 +128,8 @@ def combine_maps(lap_map: np.ndarray, dl_map: np.ndarray, w_deeplab: float) -> n
 
 def compute_complexity_map(frame: np.ndarray) -> np.ndarray:
     """Return a normalized 'complexity' map based on edges."""
+    # A simple Laplacian map is the project’s lightweight estimate of where a
+    # visible watermark would be more visually disruptive.
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
@@ -128,6 +140,8 @@ def compute_complexity_map(frame: np.ndarray) -> np.ndarray:
 
 def _frame_in_skip_ranges(frame_idx: int, skip_ranges: list[tuple[int, int]] | None) -> bool:
     """True if frame_idx falls inside any [start, end] skip range."""
+    # Manual editing can mark certain frame ranges as "no visible watermark",
+    # and this helper centralizes that decision.
     if not skip_ranges:
         return False
     return any(start <= frame_idx <= end for start, end in skip_ranges)
@@ -135,6 +149,8 @@ def _frame_in_skip_ranges(frame_idx: int, skip_ranges: list[tuple[int, int]] | N
 
 def _in_edge_zone(x: int, y: int, box_w: int, box_h: int, w: int, h: int, edge_margin: float) -> bool:
     """True if window (x,y) is in the edge band (outer margin from each side)."""
+    # Edge-biased placement keeps the watermark near borders where it tends to
+    # be less intrusive and harder to remove without cropping.
     pad_w = max(box_w, int(w * edge_margin))
     pad_h = max(box_h, int(h * edge_margin))
     # Center of window
@@ -164,6 +180,8 @@ def choose_low_complexity_region(
     (within edge_margin of frame borders). This keeps the watermark near
     corners/edges for less intrusion and better crop resilience.
     """
+    # Slide a watermark-sized window over the guide map and keep the location
+    # whose average cost is lowest.
     h, w = map2d.shape
     best_score = float("inf")
     fallback = (max(0, w - box_w - 20), max(0, h - box_h - 20))
@@ -171,6 +189,8 @@ def choose_low_complexity_region(
 
     for y in range(0, max(h - box_h, 1), stride):
         for x in range(0, max(w - box_w, 1), stride):
+            # If edge preference is enabled, skip candidates that sit too far
+            # inside the frame.
             if prefer_edges and not _in_edge_zone(x, y, box_w, box_h, w, h, edge_margin):
                 continue
             region = map2d[y : y + box_h, x : x + box_w]
@@ -182,6 +202,23 @@ def choose_low_complexity_region(
                 best_xy = (x, y)
 
     return best_xy
+
+
+def _clamp_motion_toward(prev_x: int, prev_y: int, cand_x: int, cand_y: int, max_step: int) -> tuple[int, int]:
+    """Limit one-frame movement so placement shifts stay visually stable."""
+    if max_step <= 0:
+        return cand_x, cand_y
+    dx = cand_x - prev_x
+    dy = cand_y - prev_y
+    dist_sq = dx * dx + dy * dy
+    if dist_sq <= max_step * max_step:
+        return cand_x, cand_y
+    dist = math.sqrt(dist_sq)
+    scale = max_step / max(dist, 1e-9)
+    return (
+        int(round(prev_x + dx * scale)),
+        int(round(prev_y + dy * scale)),
+    )
 
 
 def add_text_watermark_fixed(
@@ -199,6 +236,8 @@ def add_text_watermark_fixed(
     positions_path: Path | None = None,
 ) -> None:
     """Simple baseline: fixed bottom-right watermark for all frames."""
+    # This is the simplest baseline in the project: put the same visible text
+    # in the same corner on every frame and optionally save metadata.
     print(f"[FIXED] Opening video: {input_path}")
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -223,7 +262,8 @@ def add_text_watermark_fixed(
 
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
 
-    # Fixed bottom-right placement (same box size as others)
+    # Reuse the same text sizing logic as the adaptive pipeline so the fixed
+    # baseline stays visually comparable.
     box_w = text_w + 20
     box_h = text_h + 20
     x = width - box_w - 20
@@ -233,6 +273,8 @@ def add_text_watermark_fixed(
 
     positions = []
     frame_idx = 0
+    # Render the same watermark box on every frame and optionally save the
+    # coordinates for later detection.
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -253,6 +295,8 @@ def add_text_watermark_fixed(
         out.write(frame)
 
         if save_positions and positions_path is not None:
+            # Save per-frame metadata so the detector can reconstruct exactly
+            # what was drawn and where.
             t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
             positions.append({
                 "frame": frame_idx, "t_ms": t_ms, "x": x, "y": y,
@@ -285,11 +329,15 @@ def add_text_watermark_to_video(
     w_deeplab: float = 0.5,
 
     temporal_smoothing: bool = True,
-    temporal_alpha: float = 0.8,
-    max_jump: int = 150,
+    temporal_alpha: float = 0.85,
+    max_jump: int = 60,
     use_optical_flow: bool = False,
     use_raft_flow: bool = False,
-    flow_beta: float = 0.7,
+    flow_beta: float = 0.4,
+    flow_reject_dist: int = 60,
+    relocate_confirm_frames: int = 3,
+    relocate_match_dist: int = 28,
+    relocate_jump: int = 80,
     saliency_type: str = "deeplab",
     save_positions: bool = False,
     positions_path: Path | None = None,
@@ -313,6 +361,8 @@ def add_text_watermark_to_video(
         - Smooth watermark position over time to avoid jitter.
     """
 
+    # Build a readable mode label so logs clearly show which placement strategy
+    # was used for this output.
     if use_hybrid:
         mode = f"HYBRID(wD={w_deeplab:.2f})"
     elif use_saliency_model:
@@ -349,6 +399,8 @@ def add_text_watermark_to_video(
     box_w = text_w + 20
     box_h = text_h + 20
 
+    # Saliency models are loaded lazily because they are relatively heavy and
+    # are not needed for every placement mode.
     saliency_model_instance = None
     if use_saliency_model:
         if saliency_type == "u2net" and U2NetSaliency is not None:
@@ -357,7 +409,10 @@ def add_text_watermark_to_video(
             saliency_model_instance = DeepLabSaliency()
 
     prev_x, prev_y = None, None
-    max_jump_sq = max_jump * max_jump
+    flow_reject_sq = flow_reject_dist * flow_reject_dist
+    relocate_match_sq = relocate_match_dist * relocate_match_dist
+    pending_reloc_x, pending_reloc_y = None, None
+    pending_reloc_count = 0
 
     frame_idx = 0
     prev_frame = None
@@ -368,6 +423,8 @@ def add_text_watermark_to_video(
     use_saliency_thread = use_hybrid or use_saliency_model
     executor = ThreadPoolExecutor(max_workers=1) if use_saliency_thread else None
 
+    # Prime the loop by reading the first frame once. This also makes it easier
+    # to prefetch saliency for the next frame later in the loop.
     ret, frame = cap.read()
     if not ret:
         cap.release()
@@ -375,9 +432,13 @@ def add_text_watermark_to_video(
         return
 
     while True:
+        # The complexity map is always available and acts as either the full
+        # guide map or one half of the hybrid guide.
         lap_map = compute_complexity_map(frame)
 
         if use_hybrid:
+            # Hybrid mode combines structure and semantic saliency so placement
+            # avoids both detailed texture and important foreground regions.
             if saliency_model_instance is None:
                 saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
             if saliency_future is not None:
@@ -387,6 +448,8 @@ def add_text_watermark_to_video(
             guide_map = combine_maps(lap_map, dl_map, w_deeplab=w_deeplab)
 
         elif use_saliency_model:
+            # Pure saliency mode uses the learned foreground/background estimate
+            # directly as the placement guide.
             if saliency_model_instance is None:
                 saliency_model_instance = DeepLabSaliency() if saliency_type != "u2net" or U2NetSaliency is None else U2NetSaliency()
             if saliency_future is not None:
@@ -395,6 +458,7 @@ def add_text_watermark_to_video(
                 guide_map = saliency_model_instance.get_saliency_map(frame)
 
         else:
+            # Heuristic mode is the lightest option: pick low-complexity regions only.
             guide_map = lap_map
             
         # --- Optical-flow temporal consistency (proposal: RAFT) ---
@@ -414,25 +478,45 @@ def add_text_watermark_to_video(
 
 
 
-        # Instantaneous best candidate from the guide map
+        # Choose the best candidate for this frame before any temporal smoothing.
         cand_x, cand_y = choose_low_complexity_region(
             guide_map, box_w, box_h, stride=32,
             prefer_edges=prefer_edges, edge_margin=edge_margin,
         )
 
-        # Temporal smoothing of position
+        # Temporal smoothing keeps motion stable, but large relocations are only
+        # accepted if the same target persists across multiple frames.
         if temporal_smoothing and prev_x is not None and prev_y is not None:
             dx = cand_x - prev_x
             dy = cand_y - prev_y
             dist_sq = dx * dx + dy * dy
 
-            if dist_sq <= max_jump_sq:
-                # Smooth: EMA between previous and candidate
-                x = int(temporal_alpha * prev_x + (1.0 - temporal_alpha) * cand_x)
-                y = int(temporal_alpha * prev_y + (1.0 - temporal_alpha) * cand_y)
+            if dist_sq > flow_reject_sq:
+                if pending_reloc_x is not None and pending_reloc_y is not None:
+                    pdx = cand_x - pending_reloc_x
+                    pdy = cand_y - pending_reloc_y
+                    if pdx * pdx + pdy * pdy <= relocate_match_sq:
+                        pending_reloc_count += 1
+                    else:
+                        pending_reloc_x, pending_reloc_y = cand_x, cand_y
+                        pending_reloc_count = 1
+                else:
+                    pending_reloc_x, pending_reloc_y = cand_x, cand_y
+                    pending_reloc_count = 1
+
+                if pending_reloc_count >= max(1, relocate_confirm_frames):
+                    cand_x, cand_y = _clamp_motion_toward(prev_x, prev_y, pending_reloc_x, pending_reloc_y, relocate_jump)
+                    pending_reloc_x, pending_reloc_y = None, None
+                    pending_reloc_count = 0
+                else:
+                    cand_x, cand_y = prev_x, prev_y
             else:
-                # Likely a scene change; allow jump
-                x, y = cand_x, cand_y
+                pending_reloc_x, pending_reloc_y = None, None
+                pending_reloc_count = 0
+                cand_x, cand_y = _clamp_motion_toward(prev_x, prev_y, cand_x, cand_y, max_jump)
+
+            x = int(round(temporal_alpha * prev_x + (1.0 - temporal_alpha) * cand_x))
+            y = int(round(temporal_alpha * prev_y + (1.0 - temporal_alpha) * cand_y))
         else:
             x, y = cand_x, cand_y
 
@@ -442,8 +526,8 @@ def add_text_watermark_to_video(
 
         prev_x, prev_y = x, y
         
-        # DCT-based invisible watermark (proposal: hybrid DCT embedding)
-        # Place DCT AWAY from visible text to avoid overlay corrupting coefficients
+        # If the run also requested a DCT watermark, embed it in a nearby but
+        # separate ROI so the visible text does not interfere with extraction.
         if embed_dct_watermark is not None and embed_dct_payload:
             dct_sz = max(64, (dct_roi_size // 8) * 8)
             # Prefer: right of text box, else below, else opposite corner
@@ -460,6 +544,8 @@ def add_text_watermark_to_video(
             dct_roi = None
 
         if save_positions:
+            # Persist everything detection or later re-export needs: visible box,
+            # rendering settings, motion parameters, and optional DCT ROI.
             t_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
             pos_entry = {
                 "frame": int(frame_idx),
@@ -473,6 +559,10 @@ def add_text_watermark_to_video(
                 "mode": mode,
                 "w_deeplab": float(w_deeplab),
                 "flow_beta": float(flow_beta),
+                "flow_reject_dist": int(flow_reject_dist),
+                "relocate_confirm_frames": int(relocate_confirm_frames),
+                "relocate_match_dist": int(relocate_match_dist),
+                "relocate_jump": int(relocate_jump),
                 "temporal_alpha": float(temporal_alpha),
                 "max_jump": int(max_jump),
                 "alpha": float(alpha),
@@ -488,6 +578,8 @@ def add_text_watermark_to_video(
             positions.append(pos_entry)
 
         if draw_visible_text:
+            # Render the visible watermark only after hidden payload embedding
+            # and metadata bookkeeping are done for this frame.
             overlay = frame.copy()
             text_x = x + 10
             text_y = y + box_h - 10
@@ -516,7 +608,8 @@ def add_text_watermark_to_video(
         if frame_idx % 10 == 0:
             print(f"[{mode}] Processed {frame_idx}/{frame_count} frames...")
 
-        # Prefetch saliency for next frame
+        # Start computing saliency for the next frame in the background so the
+        # current iteration can overlap with the next model call.
         ret_next, next_frame = cap.read()
         if not ret_next:
             break
@@ -530,6 +623,8 @@ def add_text_watermark_to_video(
     out.release()
     print(f"[{mode}] Saved watermarked video to: {output_path}")
     if save_positions:
+        # Write the per-frame positions file that powers detection, manual
+        # adjustment, and later forensic analysis.
         import json
         if positions_path is None:
             positions_path = output_path.with_suffix(".positions.json")
@@ -553,6 +648,8 @@ def add_text_watermark_from_positions(
     """
     import json
 
+    # This path is used by manual editing: take an existing positions file and
+    # replay it exactly onto the source video.
     with open(positions_path, "r", encoding="utf-8") as f:
         positions = json.load(f)
     if not positions:
@@ -579,6 +676,8 @@ def add_text_watermark_from_positions(
         if not ret:
             break
 
+        # Reuse the saved per-frame metadata so the export matches the edited
+        # positions file exactly, including hidden visible-skip ranges.
         pos_idx = min(frame_idx, len(positions) - 1)
         p = positions[pos_idx]
         x = int(p["x"])
@@ -595,6 +694,8 @@ def add_text_watermark_from_positions(
         text_y = y + box_h - 10
 
         if not skip_visible:
+            # Only draw the visible text when this frame was not intentionally
+            # suppressed by manual editing.
             overlay = frame.copy()
             cv2.putText(
                 overlay,
@@ -628,6 +729,8 @@ def add_text_watermark_fixed_at(
     Fixed watermark at user-specified (x, y) for all frames.
     Optionally saves positions.json for detection.
     """
+    # This helper is the simplest manual override: pin the visible watermark to
+    # one user-selected location for the entire clip.
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video: {input_path}")
@@ -662,6 +765,8 @@ def add_text_watermark_fixed_at(
             break
         skip_visible = _frame_in_skip_ranges(frame_idx, skip_ranges)
         if not skip_visible:
+            # Draw the fixed watermark unless this frame sits inside a manual
+            # no-watermark range.
             overlay = frame.copy()
             cv2.putText(overlay, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
             cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
@@ -699,6 +804,8 @@ def get_frame_heatmap(
     Returns: (frame_bgr, heatmap_overlay_rgb, x, y, box_w, box_h, font_scale, thickness)
     method: "fixed" | "heuristic" | "deeplab" | "hybrid"
     """
+    # The manual-adjust tab uses this helper to visualize the placement guide
+    # and the suggested box for one chosen frame.
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video: {video_path}")
@@ -718,10 +825,14 @@ def get_frame_heatmap(
     box_h = text_h + 20
 
     if method == "fixed":
+        # Fixed mode still shows a heatmap, but the suggested position is the
+        # standard bottom-right baseline.
         x = w - box_w - 20
         y = h - box_h - 20
         guide_map = compute_complexity_map(frame)
     else:
+        # For adaptive modes, rebuild the same guide map logic used during
+        # actual watermark generation.
         lap_map = compute_complexity_map(frame)
         if method == "heuristic":
             guide_map = lap_map
@@ -741,6 +852,8 @@ def get_frame_heatmap(
     x = max(0, min(x, w - box_w - 1))
     y = max(0, min(y, h - box_h - 1))
 
+    # Turn the scalar guide map into a colored overlay that is easier for a
+    # human editor to read in the UI.
     guide_norm = cv2.normalize(guide_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     heatmap_rgb = cv2.applyColorMap(guide_norm, cv2.COLORMAP_JET)
     heatmap_overlay = cv2.addWeighted(frame, 0.6, heatmap_rgb, 0.4, 0)
@@ -760,11 +873,14 @@ def interpolate_keyframes_to_positions(
     keyframes: [(frame_idx, x, y), ...] sorted by frame_idx.
     base_pos: template dict with box_w, box_h, text, font_scale, thickness, alpha.
     """
+    # Convert a sparse set of edited keyframes into one full per-frame positions
+    # file that the normal export code can replay.
     if not keyframes:
         return []
     keyframes = sorted(keyframes, key=lambda k: k[0])
 
     def interp(frame_idx: int) -> tuple[int, int]:
+        # Interpolate linearly between the nearest surrounding keyframes.
         if frame_idx <= keyframes[0][0]:
             return keyframes[0][1], keyframes[0][2]
         if frame_idx >= keyframes[-1][0]:
@@ -779,6 +895,7 @@ def interpolate_keyframes_to_positions(
                 return x, y
         return keyframes[-1][1], keyframes[-1][2]
 
+    # Build a detector-ready metadata entry for every frame in the clip.
     positions = []
     for fidx in range(frame_count):
         x, y = interp(fidx)
@@ -806,6 +923,8 @@ def add_text_watermark_from_keyframes(
     Apply watermark using keyframe-interpolated positions.
     keyframes: [(frame_idx, x, y), ...]. Positions for other frames are interpolated.
     """
+    # This is the higher-level manual editing path: generate a full positions
+    # list from keyframes, then reuse the generic replay exporter.
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video: {input_path}")
@@ -829,6 +948,8 @@ def add_text_watermark_from_keyframes(
     }
     positions = interpolate_keyframes_to_positions(keyframes, frame_count, base_pos, fps, skip_ranges=skip_ranges)
 
+    # Write the interpolated positions to a temporary json file so we can reuse
+    # the normal "render from positions" code path without duplicating logic.
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         import json
@@ -852,7 +973,8 @@ def add_text_watermark_from_keyframes(
 if __name__ == "__main__":
     from pathlib import Path
 
-    # Choose what to run
+    # Small local harness for quick ablation or final-output experiments without
+    # going through the Streamlit UI.
     MODE = "ablation"   # "final" or "ablation"
 
     project_root = Path(__file__).resolve().parents[1]

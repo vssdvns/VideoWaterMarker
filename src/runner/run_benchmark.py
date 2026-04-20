@@ -13,6 +13,8 @@ from typing import Optional
 
 @dataclass
 class RunResult:
+    # This lightweight record lets worker processes report success or failure
+    # back to the parent benchmark process in a structured way.
     ok: bool
     clip_path: str
     clip_id: str
@@ -21,6 +23,8 @@ class RunResult:
 
 
 def _run(cmd: list[str], cwd: Optional[Path] = None) -> None:
+    # Print each command before running it so long benchmark jobs leave behind
+    # a readable execution trail in the terminal logs.
     print("[RUN]", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None)
 
@@ -32,6 +36,8 @@ def _clip_id_from_path(clips_dir: Path, clip_path: Path) -> str:
       clip_path = data/clips_150/davis/davis_davis_blackswan.mp4
       -> davis__davis_davis_blackswan
     """
+    # Turn a nested clip path into a stable id that can be reused in folder
+    # names and combined CSV rows without carrying the full path around.
     rel = clip_path.relative_to(clips_dir).with_suffix("")
     parts = list(rel.parts)
     if len(parts) >= 2:
@@ -49,6 +55,8 @@ def process_one(
     search_pad: int,
     thr: float,
 ) -> RunResult:
+    # Each clip gets its own run directory so watermarking, attacks, and
+    # detection outputs stay grouped together and can be inspected later.
     clip_id = _clip_id_from_path(clips_dir, clip_path)
     run_dir = out_root / "runs" / clip_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -59,7 +67,7 @@ def process_one(
     detect_csv = run_dir / "robustness_results.csv"
 
     try:
-        # 1) Watermark
+        # Step 1: create the watermarked clip and save its positions metadata.
         _run(
             [
                 python_exe,
@@ -73,7 +81,7 @@ def process_one(
             ]
         )
 
-        # 2) Attacks
+        # Step 2: generate the attacked copies that will be used for robustness testing.
         _run(
             [
                 python_exe,
@@ -85,7 +93,7 @@ def process_one(
             ]
         )
 
-        # 3) Detect
+        # Step 3: run detection across the attacked outputs and save one CSV per clip.
         _run(
             [
                 python_exe,
@@ -106,6 +114,8 @@ def process_one(
             ]
         )
 
+        # Returning a structured success result makes it easy for the parent
+        # process to summarize many worker jobs at the end.
         return RunResult(True, str(clip_path), clip_id, str(run_dir))
 
     except subprocess.CalledProcessError as e:
@@ -115,6 +125,8 @@ def process_one(
 
 
 def combine_results(out_root: Path, combined_csv: Path) -> None:
+    # After all per-clip jobs finish, merge their CSV files into one table
+    # that is easier to analyze in spreadsheets or plotting scripts.
     rows: list[dict] = []
     runs_dir = out_root / "runs"
     for run_dir in sorted(runs_dir.glob("*")):
@@ -145,6 +157,8 @@ def combine_results(out_root: Path, combined_csv: Path) -> None:
 
 
 def main():
+    # This script is the outer benchmark driver: it discovers clips, fans the
+    # work out across processes, and then combines all results into one CSV.
     root = Path(__file__).resolve().parents[2]  # .../src/runner/run_benchmark.py -> project root
     parser = argparse.ArgumentParser()
     parser.add_argument("--clips_dir", type=str, required=True)
@@ -162,6 +176,8 @@ def main():
 
     python_exe = sys.executable
 
+    # Discover all clips first so the user can see the workload size before
+    # the expensive watermark/attack/detect pipeline begins.
     clips = sorted(clips_dir.rglob("*.mp4"))
     if args.limit and args.limit > 0:
         clips = clips[: args.limit]
@@ -178,6 +194,8 @@ def main():
     results_dir = out_root / "results"
     combined_csv = results_dir / "benchmark_results.csv"
 
+    # Process each clip independently in parallel. This keeps the benchmark
+    # simple because each worker owns its own output directory.
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = [
             ex.submit(
@@ -204,6 +222,7 @@ def main():
                 print(f"[BENCH] BAD {r.clip_path}\n  -> {r.error}")
 
     print(f"[BENCH] done. ok={ok} bad={bad}")
+    # Build the final all-clips summary only after every worker has finished.
     combine_results(out_root, combined_csv)
 
 

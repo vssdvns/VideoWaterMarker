@@ -39,13 +39,23 @@
 
 \titleformat{\chapter}[hang]
   {\normalfont\bfseries\Large}
-  {\chaptertitlename\ \thechapter:}
+  {\thechapter.}
   {0.6em}
   {}
 \titlespacing*{\chapter}{0pt}{0pt}{12pt}
 
 \newcommand{\AltText}[1]{\par\small\textit{Alternative text: #1}\normalsize}
 \newcommand{\FormulaAlt}[1]{\par\small\textit{Alternative text for equation: #1}\normalsize}
+\newcommand{\ReportTitle}{HYBRID VIDEO WATERMARKING FOR OTT PIRACY PREVENTION USING CONTENT-AWARE PLACEMENT, FORENSIC TRACEABILITY, AND ROBUST DETECTION}
+\newcommand{\StudentName}{SubhaSai DurgaVenkata Vinnakota}
+\newcommand{\DegreeName}{MASTER OF SCIENCE}
+\newcommand{\MajorName}{Computer Science}
+\newcommand{\DepartmentName}{Computer Science}
+\newcommand{\TermName}{SPRING}
+\newcommand{\TermYear}{2026}
+\newcommand{\CommitteeChair}{Dr. Bang Tran S}
+\newcommand{\SecondReader}{Dr. Ying Jin}
+\newcommand{\GraduateCoordinator}{Dr. Haiquan Chen}
 \newcommand{\PlaceholderFigure}[2]{
 \begin{figure}[htbp]
 \centering
@@ -66,50 +76,50 @@ Replace this placeholder with the exported diagram, screenshot, or chart before 
 \begin{titlepage}
 \thispagestyle{empty}
 \begin{center}
-\vspace*{0.8in}
-{\Large\bfseries HYBRID VIDEO WATERMARKING FOR OTT PIRACY PREVENTION USING CONTENT-AWARE PLACEMENT, FORENSIC TRACEABILITY, AND ROBUST DETECTION\par}
+\vspace*{0.4in}
+{\Large\bfseries \ReportTitle\par}
+\vspace{1.4in}
+A Project\par
 \vspace{1.2in}
+\begin{spacing}{1.0}
+Presented to the faculty of the Department of \DepartmentName\par
+California State University, Sacramento\par
+\end{spacing}
+\vspace{1.2in}
+\begin{spacing}{1.0}
+Submitted in partial satisfaction of\par
+the requirements for the degree of\par
+\end{spacing}
+\vspace{0.6in}
+{\large \DegreeName\par}
+\vspace{0.5in}
+in\par
+\vspace{0.3in}
+{\large \MajorName\par}
+\vspace{1.1in}
 by\par
 \vspace{0.5in}
-{\large SubhaSai DurgaVenkata Vinnakota}\par
-\vspace{1.2in}
-A project report\par
-submitted in partial satisfaction of the requirements for the degree of\par
-\vspace{0.4in}
-MASTER OF SCIENCE\par
-in\par
-COMPUTER SCIENCE\par
-\vspace{1.2in}
-at\par
-CALIFORNIA STATE UNIVERSITY, SACRAMENTO\par
-\vspace{1.0in}
-\today
+{\large \StudentName\par}
+\vfill
+\TermName\par
+\TermYear
 \end{center}
 \end{titlepage}
 
 \clearpage
 \thispagestyle{empty}
-\vspace*{2.5in}
 \begin{center}
-Copyright \copyright\ \the\year\\
-by\\
- SubhaSai DurgaVenkata Vinnakota\\
-All Rights Reserved
+\ReportTitle
+\vspace{1.0in}
+
+A Project
+\vspace{1.0in}
+
+by
+\vspace{1.0in}
+
+\StudentName
 \end{center}
-
-\clearpage
-\thispagestyle{empty}
-\begin{center}
-APPROVAL PAGE
-\end{center}
-\vspace{0.8in}
-\noindent
-Project Title: \textbf{Hybrid Video Watermarking for OTT Piracy Prevention Using Content-Aware Placement, Forensic Traceability, and Robust Detection}
-
-\vspace{0.8in}
-\noindent
-Student: SubhaSai DurgaVenkata Vinnakota
-
 \vspace{1.2in}
 \noindent
 Approved by:
@@ -117,46 +127,83 @@ Approved by:
 \vspace{1.0in}
 \noindent
 \rule{4.5in}{0.4pt}\\
-Dr. Bang Tran S, Committee Chair
-
-\vspace{1.0in}
-\noindent
-\rule{4.5in}{0.4pt}\\
-Dr. Ying Jin, Second Reader
-
-\vspace{1.0in}
-\noindent
-Student: SubhaSai DurgaVenkata Vinnakota
-
-\vspace{0.15in}
-\noindent
-I certify that this student has met the requirements for format contained in the University format manual, and this project is suitable for electronic submission to the library and credit is to be awarded for the project.
-
-\vspace{0.8in}
-\noindent
-\rule{4.5in}{0.4pt}\\
-Dr. Haiquan Chen, Graduate Coordinator
-
-\vspace{0.8in}
-\noindent
-Date: \rule{2.5in}{0.4pt}
+{\CommitteeChair, Committee Chair}
 
 \vspace{0.5in}
 \noindent
-Department of Computer Science
+\hspace*{0.1in}Date
 
-\vfill
+\vspace{1.0in}
 \noindent
-Date: \rule{2.5in}{0.4pt}
+\rule{4.5in}{0.4pt}\\
+{\SecondReader, Second Reader}
+
+\vspace{1.0in}
+\noindent
+\hspace*{0.1in}Date
 
 \clearpage
-\chapter*{Abstract}
-\addcontentsline{toc}{chapter}{Abstract}
+\thispagestyle{empty}
+
+\vspace*{2.0in}
+\noindent
+Student: \StudentName
+
+\vspace{0.8in}
+\noindent
+I certify that this student has met the requirements for format contained in the University format manual, and this project is suitable for electronic submission to the library and credit is to be awarded for the project.
+
+\vspace{1.0in}
+\noindent
+\rule{3.7in}{0.4pt}\hfill Date\\
+\GraduateCoordinator, Graduate Coordinator
+
+\vspace{0.8in}
+\noindent
+Department of \DepartmentName
+
+\clearpage
+\thispagestyle{empty}
+\begin{center}
+Abstract
+
+\vspace{0.3in}
+of
+
+\vspace{0.3in}
+\ReportTitle
+
+\vspace{0.6in}
+by
+
+\vspace{0.3in}
+\StudentName
+\end{center}
+
+\vspace{0.6in}
+\noindent\textbf{Statement of Problem}
+
 This project studies how to watermark video in a way that is practical for over-the-top streaming platforms. The main goal is to place a visible watermark where it is less distracting while still keeping it recoverable after common distortions such as re-encoding, blur, crop, grayscale conversion, frame-rate reduction, and resize. A second goal is traceability, so that a leaked copy can still be tied back to a user or session. To address both needs, the project combines visible watermarking, invisible payload embedding, detection, attack testing, and a user-facing application in one workflow.
+
+\vspace{0.3in}
+\noindent\textbf{Sources of Data}
 
 The implemented system uses Laplacian-based complexity, semantic saliency from pretrained models, temporal smoothing, optional optical flow, visible text rendering, discrete cosine transform payload embedding, and a neural watermarking branch. It also stores frame-level placement metadata in a \texttt{positions.json} file so that detection can use both local search and a global fallback when the watermark shifts after attack. The broader project workflow draws on a standardized 150-clip training corpus for model development and a separate 26-clip HD benchmark for visible robustness evaluation. In that benchmark, the visible channel achieved 94.6\% mean detection at a normalized cross-correlation threshold of 0.40, while later local batch evaluation showed that the DCT and neural channels can provide useful supporting forensic information.
 
+\vspace{0.3in}
+\noindent\textbf{Conclusions Reached}
+
 The main conclusion is that content-aware visible watermarking is the strongest and most mature part of the system. The DCT and neural branches make the design more complete and more useful for forensic tracing, but they still involve stronger quality-versus-robustness tradeoffs. Overall, the project delivers a full workflow for watermark generation, manual adjustment, detection, attack testing, and traceability in a form that is technically credible, practical to demonstrate, and well suited to a master's final project.
+
+\vspace{0.8in}
+\noindent\hfill\rule{2.8in}{0.4pt}
+
+\noindent\hfill\CommitteeChair, Committee Chair
+
+\vspace{0.6in}
+\noindent\hfill\rule{2.0in}{0.4pt}
+
+\noindent\hfill Date
 
 \clearpage
 \chapter*{Acknowledgements}
@@ -175,22 +222,17 @@ Special thanks go to the open-source communities behind OpenCV, PyTorch, Streaml
 \clearpage
 \begingroup
 \singlespacing
-\listoftables
-\endgroup
-\clearpage
-\begingroup
-\singlespacing
 \listoffigures
 \endgroup
 
 \clearpage
-\chapter{Introduction}
-\section{Purpose of the Project}
+\chapter{INTRODUCTION}
+\section{Purpose}
 This project was carried out to build and evaluate a practical video watermarking system for piracy deterrence and traceability in over-the-top streaming settings. The work sits between two common extremes. On one side are simple visible overlays that are easy to add but often distract viewers and can be removed by basic editing. On the other side are more advanced invisible watermarking ideas that are promising in theory but harder to reproduce, explain, and connect to a usable application. The purpose of this project was to bring those worlds together in a single system that could be tested, demonstrated, and discussed clearly.
 
 The main idea behind the project is straightforward: watermarking should not be treated as a single drawing step. A useful system has to decide where the watermark should go, how strong it should be, how it should be recovered later, and how the output can be traced back to a specific viewer when needed. Those choices affect each other. A watermark that looks better may be harder to recover. A watermark that is easier to detect may be more distracting. The project therefore approaches watermarking as a balanced engineering problem rather than as a search for one perfect algorithm.
 
-\section{Problem Statement}
+\section{Problem}
 Video piracy is still a serious problem for streaming platforms because a video can be screen-recorded, re-encoded, cropped, reposted, and shared widely with very little effort. Visible watermarks are still widely used because they are easy to understand and can directly show ownership or a user identifier. Their weakness is that they can become annoying if they cover a face, text, or another important part of the frame. Invisible watermarks help with forensic tracing, but they raise different problems around quality, robustness, and implementation effort. The core problem in this project is therefore the following: \textit{how can a video watermarking system place a visible watermark in a less distracting area, add invisible support when needed, and still detect the watermark reliably after common attacks, all within a usable software application?}
 
 This problem breaks into four practical questions. First, the system must solve the \textbf{placement problem}: where should the watermark go so that it does not distract the viewer too much? Second, it must solve the \textbf{stability problem}: how can it avoid jitter from one frame to the next? Third, it must solve the \textbf{detection problem}: how can it still find the watermark after crop, compression, blur, or resize? Fourth, it must solve the \textbf{traceability problem}: how can the output be tied to a specific user, session, or device? These questions guide the rest of the report.
@@ -198,7 +240,7 @@ This problem breaks into four practical questions. First, the system must solve 
 \section{Project Scope}
 The scope of the project spans both research and software engineering. On the research side, it covers visible placement, DCT watermarking, neural watermarking, error correction, and robust detection. On the engineering side, it includes a Streamlit interface, attack testing, manual adjustment, a FastAPI service, and HLS scaffolding. At the same time, the project stays within clear limits. It does not claim to be a commercial forensic watermarking product, and it does not claim that its invisible channels outperform specialized industrial systems. Its contribution is a solid, well-documented academic prototype that can be tested and extended.
 
-\section{Collaboration Details}
+\section{Statement of Collaboration}
 This project was completed as an individual master's final year project under academic supervision. The work developed through repeated cycles of reading, prototyping, debugging, attack testing, UI refinement, and written review. Faculty feedback helped shape the project goals and the final report, while open-source libraries and pretrained models provided the technical building blocks used for saliency estimation, optical flow, and neural watermarking. Development also included AI-assisted iteration for coding support, debugging, and report refinement, while final design decisions, implementation integration, evaluation, and written responsibility remained with the author.
 
 \section{Objectives}
@@ -249,7 +291,7 @@ The project was guided by four main questions: can adaptive placement make a vis
 The remainder of this report is organized as follows. Chapter 2 reviews the technical background of digital watermarking, content-aware placement, forensic payload encoding, optical flow stabilization, and neural watermarking. Chapter 3 presents the design methodology, including system architecture, mathematical formulation, and module-level integration. Chapter 4 describes implementation details and experimental results, including benchmark metrics and discussion of quality-robustness tradeoffs. Chapter 5 concludes the project and identifies limitations and realistic future extensions.
 
 \clearpage
-\chapter{Background and Literature Review}
+\chapter{BACKGROUND OF THE STUDY}
 \section{Digital Watermarking in Multimedia Systems}
 Digital watermarking is broadly concerned with embedding identifying information into media such that the media remains usable while the identifying information remains recoverable or at least detectable. In the context of video, the design space becomes more complex than in still images because temporal consistency matters. A watermark that moves erratically between adjacent frames may technically exist, yet still fail from a user-experience perspective because the overlay draws attention to itself. Similarly, a watermark that is recoverable from a single frame under laboratory conditions may fail when an attacker crops the frame, reduces the resolution, changes the frame rate, or re-encodes the video using aggressive compression settings. This means that practical video watermarking sits at the intersection of image processing, signal processing, human perception, and systems integration.
 
@@ -296,7 +338,7 @@ The project adopts this perspective by supporting both direct identifiers and ha
 The literature and tooling landscape suggest a gap that is well suited to a master's project. There are many components available in isolation: saliency estimation, transform-domain watermarking, neural image watermarking, optical flow, cryptographic payload protection, and web application frameworks. What is less common in student-scale academic projects is an integrated pipeline that joins these pieces into a usable, inspectable, and benchmarked system. This project positions itself in that gap. Its contribution is not the invention of a wholly new watermarking primitive. Rather, it is the design and evaluation of a coherent hybrid watermarking system that combines content-aware placement, robust visible detection, forensic payload handling, and interactive tooling in a reproducible framework.
 
 \clearpage
-\chapter{Methodology and System Design}
+\chapter{METHODOLOGY AND SYSTEM DESIGN}
 \section{Design Requirements}
 The methodology began from a concrete set of system requirements. The watermark needed to be visible enough to serve as a deterrent, but also sufficiently unobtrusive to preserve watchability. The system needed to save enough metadata to support later detection. It needed to permit user-specific or session-specific identifiers so that the output could serve forensic goals. The detection path needed to tolerate ordinary distribution artifacts such as compression and scaling. The implementation also needed to remain accessible to non-expert users, which motivated the inclusion of an interactive application rather than only command-line scripts.
 
@@ -468,7 +510,7 @@ One of the methodological decisions that strongly influences the system's practi
 The metadata approach also supports other parts of the system. The manual-adjust tab can re-export edited outputs because it can interpolate or override saved positions. The attack-test tab can compare attacked outputs against known per-frame expectations. The traceability flow can associate visible and invisible outputs with a single run. Selective no-watermark ranges can be stored as \texttt{skip\_visible} flags without changing the rest of the export logic. In this sense, metadata persistence is not an accessory; it is a design backbone that binds together rendering, detection, usability, and evaluation.
 
 \clearpage
-\chapter{Implementation and Results}
+\chapter{IMPLEMENTATION AND RESULTS}
 \section{Implementation Environment}
 The system was implemented mainly in Python using OpenCV, NumPy, PyTorch, torchvision, Streamlit, FFmpeg, \texttt{reedsolo}, and \texttt{pycryptodome}. The code is organized so that the visible, DCT, and neural branches can be enabled independently or together. This made development easier because each branch could be tested without changing the rest of the pipeline.
 
@@ -590,7 +632,7 @@ The system also depends on placement metadata for visible detection. This is a r
 Taken together, the results support a clear conclusion: adaptive visible watermarking with hybrid placement and fallback detection is the strongest part of the system, while the DCT and neural branches add useful forensic support without yet matching the visible channel in robustness. That balance is appropriate for a master's project because it shows both a strong core result and a realistic path for future improvement.
 
 \clearpage
-\chapter{Conclusion and Future Work}
+\chapter{CONCLUSION AND FUTURE WORK}
 \section{Conclusion}
 This project set out to build a video watermarking system that was not only technically interesting, but also practical to use and defend in a graduate report. The final system combines visible text overlays, adaptive placement based on frame content, temporal smoothing, optional optical flow, traceability support, invisible DCT payloads, and a neural watermarking branch. Just as importantly, it wraps those parts into a working application with generation, preview, manual editing, detection, and attack testing.
 

@@ -20,6 +20,8 @@ except ImportError:
 
 def _load_payload_bits(encoder_path: Path | str, decoder_path: Path | str) -> int:
     """Load payload_bits from config.json if present, else default 48."""
+    # Keep model metadata next to the checkpoints so inference can recover the
+    # right payload size without hardcoding it in multiple places.
     enc_p = Path(encoder_path)
     config_path = enc_p.parent / "config.json"
     if config_path.exists():
@@ -37,6 +39,8 @@ class NeuralWatermarker:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         delta_scale: float = 0.06,
     ) -> None:
+        # Build the encoder/decoder pair, infer payload size from config when
+        # possible, and load any saved checkpoints requested by the caller.
         enc_p = Path(encoder_path) if encoder_path else None
         dec_p = Path(decoder_path) if decoder_path else None
         self.payload_bits = payload_bits if payload_bits is not None else (
@@ -76,10 +80,14 @@ class NeuralWatermarker:
         delta_smooth_sigma: If > 0, apply Gaussian blur to delta to reduce haloing around
           high-contrast edges (e.g. tree branches). 1.0–1.5 typically helps. 0 = no smoothing.
         """
+        # Normalize the payload length first so the network always sees the
+        # exact bit count it was trained to embed.
         payload_bits = list(payload_bits) if not isinstance(payload_bits, list) else payload_bits
         if len(payload_bits) < self.payload_bits:
             payload_bits = list(payload_bits) + [0] * (self.payload_bits - len(payload_bits))
         payload_bits = payload_bits[:self.payload_bits]
+        # Resize to the model's working resolution, run the encoder there, and
+        # later bring only the learned delta back to the original frame size.
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         cover_small = cv2.resize(rgb, (256, 256))
@@ -88,6 +96,8 @@ class NeuralWatermarker:
         p = torch.tensor([payload_bits], dtype=torch.float32, device=self.device)
         t = t.to(self.device)
 
+        # Allow UI or scripts to override strength at inference time without
+        # rebuilding the model.
         if delta_scale is not None:
             self.encoder.set_delta_scale(delta_scale)
 
@@ -114,7 +124,8 @@ class NeuralWatermarker:
             mask = np.stack([mask] * 3, axis=-1)
             delta_full = delta_full * mask
 
-            # Color preservation: reduce/eliminate color shift
+            # Color handling decides how much the residual is allowed to change
+            # perceived color versus only brightness.
             if color_mode == "bias_corrected":
                 # Remove per-channel DC offset (eliminates uniform color tint)
                 for c in range(3):
@@ -134,7 +145,7 @@ class NeuralWatermarker:
                 k = max(3, int(6 * delta_smooth_sigma) | 1)  # odd kernel
                 delta_full = cv2.GaussianBlur(delta_full, (k, k), delta_smooth_sigma)
 
-            # Add to original frame (normalized [0,1] then back to uint8)
+            # Merge the residual back into the original full-resolution frame.
             frame_f = rgb.astype(np.float32) / 255.0
             watermarked = np.clip(frame_f + delta_full, 0, 1).astype(np.float32)
             out_np = (watermarked * 255).clip(0, 255).astype(np.uint8)
@@ -147,11 +158,15 @@ class NeuralWatermarker:
 
     def extract(self, frame: np.ndarray) -> np.ndarray:
         """Extract payload bits from frame (hard 0/1 via threshold)."""
+        # This is the simple inference path used when only a binary bit vector
+        # is needed and per-bit confidence does not matter.
         probs = self.extract_probs(frame)
         return (probs > 0.5).astype(np.float32)
 
     def extract_probs(self, frame: np.ndarray) -> np.ndarray:
         """Extract payload probabilities from frame. Use for confidence-weighted voting."""
+        # The decoder runs on the same normalized 256x256 view used during
+        # training, then returns sigmoid probabilities for each payload bit.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         small = cv2.resize(rgb, (256, 256))
         t = torch.from_numpy(small).float().permute(2, 0, 1).unsqueeze(0) / 255.0
@@ -163,6 +178,8 @@ class NeuralWatermarker:
 
 def _test():
     """Quick test: embed and extract, report bit error rate."""
+    # This self-check gives a quick sanity test after training without needing
+    # the full video UI pipeline.
     import sys
     root = Path(__file__).resolve().parents[2]
     if str(root) not in sys.path:

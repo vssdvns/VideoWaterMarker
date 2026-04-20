@@ -6,6 +6,9 @@ import sys
 
 
 def main():
+    # This CLI is the benchmark-friendly entrypoint for watermark generation.
+    # It wraps the richer video watermark module with a stable set of args that
+    # the runner can call repeatedly across many clips.
     root = Path(__file__).resolve().parents[1]  # project root
     sys.path.insert(0, str(root))
 
@@ -17,7 +20,8 @@ def main():
     parser.add_argument("--text", type=str, default="VideoWaterMarker")
     parser.add_argument("--alpha", type=float, default=0.5)
 
-    # Force hybrid for benchmark (recommended)
+    # The benchmark path is built around the hybrid placement pipeline, with
+    # optional flow stabilization and saved positions metadata.
     parser.add_argument("--w_deeplab", type=float, default=0.6)
     parser.add_argument("--use_optical_flow", action="store_true")
     parser.add_argument("--flow_beta", type=float, default=0.7)
@@ -30,11 +34,14 @@ def main():
     out = Path(args.output)
     pos_out = Path(args.positions_out)
 
+    # Ensure both the output video and positions file can be created even when
+    # the benchmark runner points at a brand-new directory.
     out.parent.mkdir(parents=True, exist_ok=True)
     pos_out.parent.mkdir(parents=True, exist_ok=True)
 
     from src.video_watermark_demo import add_text_watermark_to_video
 
+    # Run the project’s main watermark generator with the benchmark defaults.
     add_text_watermark_to_video(
         input_path=inp,
         output_path=out,
@@ -46,14 +53,14 @@ def main():
         use_saliency_model=True,
         w_deeplab=float(args.w_deeplab),
 
-        # optional stabilization
+        # Optional motion stabilization keeps the watermark from jittering on motion-heavy clips.
         use_optical_flow=bool(args.use_optical_flow),
         flow_beta=float(args.flow_beta),
         temporal_smoothing=True,
         temporal_alpha=float(args.temporal_alpha),
         max_jump=int(args.max_jump),
 
-        # ✅ positions output (correct names)
+        # Save per-frame metadata because detection depends on it later.
         save_positions=True,
         positions_path=pos_out,
     )

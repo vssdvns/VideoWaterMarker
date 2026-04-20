@@ -42,6 +42,8 @@ class FramePayloadDataset(Dataset):
         max_frames_per_video: int = 50,
         payload_bits: int = 48,
     ) -> None:
+        # This dataset turns either cached video frames or synthetic images
+        # into cover/payload pairs for training the watermark models.
         self.data_dir = Path(data_dir)
         self.size = size
         self.synthetic = synthetic
@@ -49,8 +51,11 @@ class FramePayloadDataset(Dataset):
         self.frames: list[Path] = []
 
         if not synthetic:
+            # First gather any still images already present in the training folder.
             for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
                 self.frames.extend(self.data_dir.rglob(ext))
+            # Then walk through videos, extract a limited number of frames, and
+            # cache them so later epochs do not keep decoding video files.
             videos = []
             for ext in ("*.mp4", "*.avi", "*.mov"):
                 videos.extend(self.data_dir.rglob(ext))
@@ -73,6 +78,7 @@ class FramePayloadDataset(Dataset):
                     gc.collect()
             self.frames = list(dict.fromkeys(self.frames))[:max_frames]
 
+        # Real-data training expects at least one discovered frame or video.
         if not self.frames and not synthetic:
             raise FileNotFoundError(
                 f"No images/videos in {data_dir}. "
@@ -85,8 +91,11 @@ class FramePayloadDataset(Dataset):
         return self._length
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Every sample pairs one image with a fresh random payload so the model
+        # learns to generalize across many messages, not memorize one code.
         payload = torch.randint(0, 2, (self.payload_bits,), dtype=torch.float32)
         if self.synthetic or not self.frames:
+            # Synthetic mode is useful for quick smoke tests when no dataset is ready yet.
             img = np.random.randint(0, 256, (self.size, self.size, 3), dtype=np.uint8)
         else:
             idx = i % len(self.frames)
@@ -114,6 +123,8 @@ def train_one_epoch(
     mse_weight: float = 2.0,
     delta_weight: float = 0.5,
 ) -> tuple[float, float, float]:
+    # One epoch trains the encoder/decoder on both clean and attacked views of
+    # the watermarked image, while also optionally supervising the residual.
     enc.train()
     dec.train()
     if dec_delta is not None:
@@ -123,23 +134,32 @@ def train_one_epoch(
     total_mse = 0.0
     n = 0
     for bi, (cover, payload) in enumerate(loader):
+        # Periodic garbage collection helps low-memory machines survive longer
+        # training runs without changing the actual learning logic.
         if gc_every_n_batches and bi > 0 and bi % gc_every_n_batches == 0:
             gc.collect()
         cover = cover.to(device)
         payload = payload.to(device)
+        # Create the watermarked image and residual delta for this batch.
         watermarked = enc(cover, payload)
         delta = watermarked - cover
+        # Ask the decoder to recover payload bits from both clean and attacked
+        # versions so the model learns robustness, not just memorization.
         pred_clean = dec(watermarked)
         pred_attacked = dec(attack(watermarked))
         bce_clean = F.binary_cross_entropy_with_logits(pred_clean, payload)
         bce_attacked = F.binary_cross_entropy_with_logits(pred_attacked, payload)
         bce = (1 - attack_weight) * bce_clean + attack_weight * bce_attacked
         mse = F.mse_loss(watermarked, cover)
+        # The total loss balances decodability against visual similarity.
         loss = bce + mse_weight * mse
         if dec_delta is not None and delta_weight > 0:
+            # The auxiliary delta decoder gives the encoder a more direct hint
+            # that the residual itself should carry readable information.
             pred_delta = dec_delta(delta)
             bce_delta = F.binary_cross_entropy_with_logits(pred_delta, payload)
             loss = loss + delta_weight * bce_delta
+        # Standard optimization step with gradient clipping to keep training stable.
         enc_opt.zero_grad()
         dec_opt.zero_grad()
         if dec_delta_opt is not None:
@@ -162,6 +182,8 @@ def train_one_epoch(
 
 
 def main():
+    # This CLI is the training control panel: it selects dataset size, training
+    # preset, attack strength, output directory, and the overall resource budget.
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data/input", help="Frames or video directory")
     ap.add_argument("--epochs", type=int, default=20)
@@ -204,7 +226,7 @@ def main():
     ap.add_argument("--max_frames", type=int, default=2000, help="Max frames in dataset")
     args = ap.parse_args()
 
-    # Overnight mode: gentle on PC
+    # Overnight mode sacrifices speed and capacity to stay friendly to weaker machines.
     if args.overnight:
         args.batch = 2
         args.size = 128
@@ -213,7 +235,8 @@ def main():
         args.max_frames_per_video = 25
         print("[TRAIN] Overnight mode: batch=2, size=128, CPU, reduced frames")
 
-    # Fast preset: 8 bits, few frames, small size, no attacks, optimized for ~20–30min
+    # Fast preset is meant for quick iteration when the goal is "does this
+    # basically work?" rather than best robustness.
     if args.fast:
         args.payload_bits = 8
         args.size = 64
@@ -226,7 +249,8 @@ def main():
         args.delta_weight = 1.0
         print("[TRAIN] Fast mode: 8 bits, 100 frames, size 64, no attacks, phase0=40, delta_w=1.0")
 
-    # Improved preset: 8 bits, 180–200 ep, gentle attack curriculum, low MSE early, resize attack
+    # Improved preset is the more serious training path used for better BER
+    # and stronger attack tolerance.
     if args.improved:
         args.payload_bits = 8
         args.epochs = max(args.epochs, 180)
@@ -242,7 +266,8 @@ def main():
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Fallback: PyTorch may be CPU-only, or GPU incompatible (e.g. RTX 50 sm_120 needs cu128)
+    # GPU selection is validated explicitly because some environments report
+    # CUDA but still fail once a real kernel launches.
     cuda_ok = False
     if args.device == "cuda":
         try:
@@ -259,6 +284,8 @@ def main():
     if cuda_ok:
         torch.backends.cudnn.benchmark = args.fast
 
+    # Resolve project paths and construct the dataset/dataloader once the
+    # runtime mode has been finalized.
     root = Path(__file__).resolve().parents[2]
     data_dir = root / args.data_dir
     out_dir = root / args.out_dir
@@ -281,11 +308,14 @@ def main():
     )
 
     device = torch.device(args.device)
+    # Build the trainable models and the differentiable attack module.
     enc = Encoder(payload_bits=payload_bits).to(device)
     dec = Decoder(payload_bits=payload_bits).to(device)
     dec_delta = DecoderDelta(payload_bits=payload_bits).to(device)
     attack = AttackSimulator(blur_sigma=args.blur_sigma, noise_std=args.noise_std, resize_scale=args.resize_scale).to(device)
 
+    # Phase 0 starts with a more forgiving setup so the model first learns how
+    # to carry the payload at all before stronger visual constraints kick in.
     lr0 = args.lr_phase0
     enc_opt = torch.optim.Adam(enc.parameters(), lr=lr0)
     dec_opt = torch.optim.Adam(dec.parameters(), lr=lr0)
@@ -302,24 +332,31 @@ def main():
     enc.set_delta_scale(0.12)
     gc_interval = 20 if args.overnight else 0
 
+    # Training is split into phases so the model learns in stages: first easy,
+    # then clean-but-constrained, then attack-aware and lower-strength.
     for ep in range(args.epochs):
         if ep == phase0_epochs:
             mse_weight = 0.3
             print(f"[TRAIN] Phase 1 started (mse={mse_weight})")
         if ep == phase1_epochs:
+            # Lower the residual scale once the network has learned the task so
+            # later epochs chase better quality at a harder difficulty.
             enc.set_delta_scale(0.08)
             enc_opt = torch.optim.Adam(enc.parameters(), lr=1e-3)
             dec_opt = torch.optim.Adam(dec.parameters(), lr=1e-3)
             print(f"[TRAIN] Phase 2 started (attack enabled, delta=0.08)")
         if ep < phase0_epochs:
+            # Phase 0: focus on payload learning first, without visual pressure.
             attack_weight = 0.0
             mse_weight = 0.0
             delta_weight = args.delta_weight
         elif ep < phase1_epochs:
+            # Phase 1: still clean images, but begin encouraging better visual quality.
             attack_weight = 0.0
             mse_weight = 0.05 if args.improved else (0.1 if args.fast else 0.2)
             delta_weight = args.delta_weight * 0.6
         else:
+            # Phase 2: gradually increase attack pressure and quality pressure together.
             frac = (ep - phase1_epochs) / max(1, phase2_epochs)
             attack_weight = (0.1 + 0.4 * frac) if args.improved else (0.2 + 0.6 * frac)
             mse_weight = (0.2 + 0.5 * frac) if args.improved else (0.5 + 0.5 * frac)
@@ -333,12 +370,15 @@ def main():
             delta_weight=delta_weight,
         )
         print(f"Epoch {ep+1}/{args.epochs} loss={loss:.4f} BCE={bce:.4f} MSE={mse:.6f}")
+        # Save checkpoints regularly so long runs can be inspected or resumed
+        # without waiting for the entire training schedule to finish.
         if (ep + 1) % 5 == 0:
             torch.save(enc.state_dict(), out_dir / "encoder.pt")
             torch.save(dec.state_dict(), out_dir / "decoder.pt")
             print(f"  -> checkpoint saved")
         gc.collect()
 
+    # Save the final weights plus payload-size metadata used later by inference.
     torch.save(enc.state_dict(), out_dir / "encoder.pt")
     torch.save(dec.state_dict(), out_dir / "decoder.pt")
     import json

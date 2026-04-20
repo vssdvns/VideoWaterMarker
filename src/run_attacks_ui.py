@@ -5,8 +5,13 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+# The UI uses the same ffmpeg defaults every time so attack runs stay quiet,
+# overwrite old files, and behave consistently during interactive testing.
 FFMPEG = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats"]
 
+# This dictionary is the menu the Streamlit app exposes in the attack tab.
+# The key is the user-facing attack id, and the value is the ffmpeg snippet
+# needed to generate that distorted version of the video.
 ATTACKS: dict[str, list[str]] = {
     "reencode_crf28": ["-c:v", "libx264", "-crf", "28", "-preset", "veryfast"],
     "reencode_crf35": ["-c:v", "libx264", "-crf", "35", "-preset", "veryfast"],
@@ -27,13 +32,18 @@ def run_attacks(input_path: Path, out_dir: Path, attack_names: list[str]) -> lis
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
     for name in attack_names:
+        # Ignore unknown attack names so the UI can stay resilient even if
+        # a stale selection or typo makes it here.
         if name not in ATTACKS:
             continue
         out_path = out_dir / f"{name}.mp4"
+        # Build one ffmpeg command for the selected attack and store the file
+        # under the attack name so later detection results stay easy to read.
         cmd = FFMPEG + ["-i", str(input_path)] + ATTACKS[name] + [str(out_path)]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             results.append((name, out_path))
         except subprocess.CalledProcessError:
+            # Skip failed attacks instead of crashing the whole UI run.
             pass
     return results
